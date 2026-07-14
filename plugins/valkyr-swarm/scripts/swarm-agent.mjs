@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import {
@@ -214,8 +215,8 @@ function validateConfig(config) {
 }
 
 class EvidenceLog {
-  constructor(path) {
-    this.path = path ? expandPath(path) : null;
+  constructor(receiptPath) {
+    this.path = receiptPath ? expandPath(receiptPath) : null;
     if (this.path) fs.mkdirSync(path.dirname(this.path), { recursive: true, mode: 0o700 });
   }
 
@@ -638,6 +639,13 @@ async function selfTest() {
   if (await tokenProvider({ forceRefresh: true }) !== "refreshed-token" || loginCount !== 1 || persistCount !== 1) {
     throw new Error("Expired authentication must re-login from reusable credentials");
   }
+  const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-evidence-"));
+  const evidencePath = path.join(evidenceRoot, "nested", "receipt.jsonl");
+  new EvidenceLog(evidencePath);
+  if (!fs.existsSync(path.dirname(evidencePath))) {
+    throw new Error("Evidence log parent directory was not created");
+  }
+  fs.rmSync(evidenceRoot, { recursive: true, force: true });
   const fakeJwt = ["eyJabcdefgh", "ijklmnop", "qrstuvwx"].join(".");
   const secretError = redactedError(
     `Authorization: Bearer ${fakeJwt} token=super-secret`,
