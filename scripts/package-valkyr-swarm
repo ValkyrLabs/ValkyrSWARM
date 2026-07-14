@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+OUT="$ROOT/valkyr-swarm.skill"
+
+node "$ROOT/scripts/sync-plugin.mjs"
+command -v zip >/dev/null 2>&1 || { echo "zip is required" >&2; exit 1; }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cp -R "$ROOT/plugins/valkyr-swarm" "$tmp/valkyr-swarm"
+find "$tmp/valkyr-swarm" -type f -exec touch -t 198001010000 {} +
+rm -f "$OUT"
+(cd "$tmp" && zip -X -q -r "$OUT" valkyr-swarm)
+echo "Packaged $OUT"

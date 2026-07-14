@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+SCOPE="user"
+NAME="valkyr-swarm"
+API_BASE="${VALKYR_API_BASE:-https://api-0.valkyrlabs.com/v1}"
+TOKEN_FILE="${VALKYR_SWARM_TOKEN_FILE:-$HOME/.config/valkyr-swarm/auth-token}"
+DRY_RUN=false
+REPLACE=false
+
+usage() {
+  echo "Usage: scripts/swarm-claude-install [--scope user|local|project] [--name valkyr-swarm] [--api-base URL] [--replace] [--dry-run]"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scope) SCOPE="${2:-}"; shift 2 ;;
+    --name) NAME="${2:-}"; shift 2 ;;
+    --api-base) API_BASE="${2:-}"; shift 2 ;;
+    --replace) REPLACE=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$SCOPE" in user|local|project) ;; *) echo "Invalid Claude Code scope: $SCOPE" >&2; exit 2 ;; esac
+
+NODE_BIN="$(command -v node || true)"
+CLAUDE_BIN="$(command -v claude || true)"
+[[ -n "$NODE_BIN" ]] || { echo "Node 22+ is required" >&2; exit 1; }
+[[ "$("$NODE_BIN" -p 'Number(process.versions.node.split(".")[0])')" -ge 22 ]] || { echo "Node 22+ is required" >&2; exit 1; }
+[[ -n "$CLAUDE_BIN" ]] || { echo "Claude Code CLI is required" >&2; exit 1; }
+
+SERVER="$ROOT/mcp-server/index.js"
+[[ -f "$SERVER" ]] || { echo "MCP server not found: $SERVER" >&2; exit 1; }
+
+CMD=("$CLAUDE_BIN" mcp add --env "VALKYR_API_BASE=$API_BASE" "VALKYR_SWARM_TOKEN_FILE=$TOKEN_FILE" --transport stdio --scope "$SCOPE" "$NAME" -- "$NODE_BIN" "$SERVER" --stdio)
+
+if [[ "$DRY_RUN" == true ]]; then
+  printf '%q ' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+if [[ "$REPLACE" == true ]]; then
+  "$CLAUDE_BIN" mcp remove "$NAME" --scope "$SCOPE" >/dev/null 2>&1 || true
+fi
+"${CMD[@]}"
+"$CLAUDE_BIN" mcp get "$NAME" >/dev/null 2>&1 || "$CLAUDE_BIN" mcp list >/dev/null
+echo "Valkyr SWARM MCP registered with Claude Code as $NAME ($SCOPE scope)"

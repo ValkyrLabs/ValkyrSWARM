@@ -1,0 +1,8 @@
+node_modules/
+.venv/
+.validator-deps/
+*.skill
+*.log
+*.pid
+.DS_Store
+tmp/

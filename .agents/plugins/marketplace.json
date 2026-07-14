@@ -1,0 +1,20 @@
+{
+  "name": "valkyr-swarm",
+  "interface": {
+    "displayName": "Valkyr Swarm"
+  },
+  "plugins": [
+    {
+      "name": "valkyr-swarm",
+      "source": {
+        "source": "local",
+        "path": "./plugins/valkyr-swarm"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

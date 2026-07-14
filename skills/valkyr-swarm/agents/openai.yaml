@@ -1,0 +1,4 @@
+interface:
+  display_name: "Valkyr SWARM"
+  short_description: "Install and operate tenant-scoped SWARM agents"
+  default_prompt: "Use $valkyr-swarm to join this agent to my tenant SWARM."

@@ -1,0 +1,102 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { loginWithCredentials, normalizeApiBase } from "../../scripts/swarm-auth.mjs";
+import { PROTECTED_ACTIONS, TOOLS, ValkyrSwarmClient, handleMessage } from "../index.js";
+
+test("authentication accepts username/password and extracts a session", async () => {
+  let request;
+  const token = await loginWithCredentials({
+    username: "agent@example.com",
+    password: "not-logged",
+    apiBase: "https://api-0.valkyrlabs.com/v1/",
+    fetchImpl: async (url, options) => {
+      request = { url, body: JSON.parse(options.body) };
+      return new Response(JSON.stringify({ VALKYR_AUTH: "session-token" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  assert.equal(token, "session-token");
+  assert.equal(request.url, "https://api-0.valkyrlabs.com/v1/auth/login");
+  assert.deepEqual(request.body, { username: "agent@example.com", password: "not-logged" });
+  assert.equal(normalizeApiBase("https://api-0.valkyrlabs.com/v1/"), "https://api-0.valkyrlabs.com/v1");
+});
+
+test("MCP initialize and tool discovery expose the bounded SWARM surface", async () => {
+  const client = {};
+  const initialized = await handleMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, client);
+  assert.equal(initialized.result.serverInfo.name, "valkyr-swarm");
+  const listed = await handleMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, client);
+  assert.deepEqual(listed.result.tools.map((tool) => tool.name), TOOLS.map((tool) => tool.name));
+});
+
+test("protected dispatch fails closed without a human approval receipt", async () => {
+  assert.deepEqual([...PROTECTED_ACTIONS].sort(), ["merge", "outbound.send", "production.deploy"]);
+  const client = new ValkyrSwarmClient({ env: { VALKYR_AUTH_TOKEN: "test-token" } });
+  await assert.rejects(
+    client.dispatch({ targetAgentId: "builder", action: "merge", instruction: "Merge it" }),
+    /separately correlated human approval receipt/,
+  );
+});
+
+test("safe dispatch targets one explicit agent and never accepts tenant identity", async () => {
+  let captured;
+  const client = new ValkyrSwarmClient({
+    env: { VALKYR_AUTH_TOKEN: "test-token", VALKYR_API_BASE: "https://api-0.valkyrlabs.com/v1" },
+    persistImpl: () => {},
+    fetchImpl: async (url, options) => {
+      captured = { url, headers: options.headers, body: JSON.parse(options.body) };
+      return new Response(JSON.stringify({ status: "accepted", commandId: "cmd-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  const result = await client.dispatch({
+    targetAgentId: "codex-reviewer",
+    action: "workflow.debug",
+    instruction: "Inspect the failing workflow without making changes",
+  });
+  assert.equal(result.commandId, "cmd-1");
+  assert.equal(captured.url, "https://api-0.valkyrlabs.com/v1/swarm-ops/command");
+  assert.equal(captured.body.targetInstanceId, "codex-reviewer");
+  assert.equal(captured.body.message.toSwarm.instanceId, "codex-reviewer");
+  assert.equal(captured.body.message.payload.action, "workflow.debug");
+  assert.equal(JSON.stringify(captured.body).includes("tenantId"), false);
+  assert.match(captured.headers.Authorization, /^Bearer /);
+});
+
+test("an expired session renews once from reusable credentials", async () => {
+  const authorizations = [];
+  let loginCount = 0;
+  const client = new ValkyrSwarmClient({
+    env: {
+      VALKYR_AUTH_TOKEN: "expired-token",
+      VALKYR_USERNAME: "agent@example.com",
+      VALKYR_PASSWORD: "secret",
+      VALKYR_API_BASE: "https://api-0.valkyrlabs.com/v1",
+    },
+    persistImpl: () => {},
+    fetchImpl: async (url, options) => {
+      if (url.endsWith("/auth/login")) {
+        loginCount += 1;
+        return new Response(JSON.stringify({ VALKYR_AUTH: "renewed-token" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      authorizations.push(options.headers.Authorization);
+      if (options.headers.Authorization === "Bearer expired-token") return new Response("{}", { status: 401 });
+      return new Response(JSON.stringify({ registry: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  const value = await client.agentsSnapshot();
+  assert.deepEqual(value, { registry: {} });
+  assert.equal(loginCount, 1);
+  assert.deepEqual(authorizations, ["Bearer expired-token", "Bearer renewed-token"]);
+});

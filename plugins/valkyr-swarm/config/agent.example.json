@@ -1,0 +1,16 @@
+{
+  "machineId": "example-host",
+  "serverUrl": "https://api-0.valkyrlabs.com/v1",
+  "authKeychainService": "VALKYR_AUTH",
+  "authTokenFile": "~/.config/valkyr-swarm/auth-token",
+  "authCredentialFile": "~/.config/valkyr-swarm/credentials.json",
+  "heartbeatSeconds": 30,
+  "agents": [
+    {
+      "agentId": "codex-example-host",
+      "runtime": "codex",
+      "capacity": 1,
+      "capabilities": ["pr.review", "workflow.debug"]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "valkyr-swarm-mcp-tools/1.0",
+  "protectedActions": ["outbound.send", "production.deploy", "merge"],
+  "tools": [
+    "swarm_status",
+    "swarm_agents_snapshot",
+    "swarm_command_status",
+    "swarm_dispatch"
+  ]
+}
