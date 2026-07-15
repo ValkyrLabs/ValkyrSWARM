@@ -16,7 +16,7 @@ import {
 } from "../scripts/swarm-auth.mjs";
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
-const SERVER_INFO = { name: "valkyr-swarm", version: "0.1.0" };
+const SERVER_INFO = { name: "valkyr-swarm", version: "0.2.0" };
 
 const TOOLS = [
   {
@@ -27,6 +27,21 @@ const TOOLS = [
   {
     name: "swarm_agents_snapshot",
     description: "List registered agents visible in the authenticated tenant SWARM with heartbeat and capability metadata.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "swarm_agent_status",
+    description: "Inspect one exact registered agent from the authenticated tenant SWARM, including capabilities and heartbeat state.",
+    inputSchema: {
+      type: "object",
+      properties: { agentId: { type: "string", minLength: 1 } },
+      required: ["agentId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "swarm_graph",
+    description: "Read the authenticated tenant's SWARM graph for topology, hierarchy, and visualization consumers.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -41,15 +56,14 @@ const TOOLS = [
   },
   {
     name: "swarm_dispatch",
-    description: "Dispatch a governed command to one explicit tenant SWARM agent. Protected actions require a separately correlated human approval receipt.",
+    description: "Dispatch a non-protected governed command to one explicit tenant SWARM agent. Protected actions fail closed and require the canonical human-approval control surface.",
     inputSchema: {
       type: "object",
       properties: {
         targetAgentId: { type: "string", minLength: 1 },
         action: { type: "string", minLength: 1 },
         instruction: { type: "string", minLength: 1, maxLength: 24000 },
-        approvalReceiptRef: { type: "string", minLength: 1 },
-        contextPageRef: { type: "string" },
+        contextPageRef: { type: "string", maxLength: 2048 },
       },
       required: ["targetAgentId", "action", "instruction"],
       additionalProperties: false,
@@ -66,7 +80,15 @@ function textResult(value, isError = false) {
 
 function safeIdentifier(value, name) {
   const normalized = String(value ?? "").trim();
-  if (!normalized || !/^[A-Za-z0-9._:-]+$/.test(normalized)) throw new Error(`${name} contains unsupported characters`);
+  if (!normalized || normalized.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(normalized)) throw new Error(`${name} contains unsupported characters`);
+  return normalized;
+}
+
+function boundedString(value, name, { min = 1, max } = {}) {
+  if (typeof value !== "string") throw new Error(`${name} must be a string`);
+  const normalized = value.trim();
+  if (normalized.length < min) throw new Error(`${name} must not be empty`);
+  if (max && normalized.length > max) throw new Error(`${name} exceeds ${max} characters`);
   return normalized;
 }
 
@@ -163,6 +185,18 @@ class ValkyrSwarmClient {
     return this.request("/swarm/agents/snapshot");
   }
 
+  async agentStatus(agentId) {
+    const normalized = safeIdentifier(agentId, "agentId");
+    const snapshot = await this.agentsSnapshot();
+    const agent = snapshot?.registry?.[normalized];
+    if (!agent) throw new Error(`Agent is not registered in the authenticated tenant SWARM: ${normalized}`);
+    return { ...agent, agentId: normalized };
+  }
+
+  graph() {
+    return this.request("/swarm-ops/graph");
+  }
+
   commandStatus(commandId) {
     return this.request(`/swarm-ops/commands/${encodeURIComponent(safeIdentifier(commandId, "commandId"))}/status`);
   }
@@ -171,24 +205,28 @@ class ValkyrSwarmClient {
     const targetAgentId = safeIdentifier(args.targetAgentId, "targetAgentId");
     const action = safeIdentifier(args.action, "action");
     const protectedAction = PROTECTED_ACTIONS.has(action.toLowerCase());
-    if (protectedAction && !args.approvalReceiptRef) {
-      throw new Error(`${action} requires a separately correlated human approval receipt`);
+    if (protectedAction) {
+      throw new Error(`${action} requires validation by the canonical human-approval control surface; portable MCP dispatch fails closed`);
     }
+    const instruction = boundedString(args.instruction, "instruction", { max: 24_000 });
+    const contextPageRef = args.contextPageRef === undefined
+      ? null
+      : boundedString(args.contextPageRef, "contextPageRef", { max: 2_048 });
     const timestamp = new Date().toISOString();
-    const sourceId = this.env.VALKYR_SWARM_MCP_INSTANCE_ID ?? "valkyr-swarm-mcp";
+    const sourceId = safeIdentifier(this.env.VALKYR_SWARM_MCP_INSTANCE_ID ?? "valkyr-swarm-mcp", "VALKYR_SWARM_MCP_INSTANCE_ID");
     const data = {
-      instruction: String(args.instruction),
+      instruction,
       source: "valkyr-swarm-mcp",
-      humanInitiated: Boolean(args.approvalReceiptRef),
-      requiresApproval: protectedAction,
-      approvalReceiptRef: args.approvalReceiptRef ?? null,
-      contextPageRef: args.contextPageRef ?? null,
+      humanInitiated: false,
+      requiresApproval: false,
+      approvalReceiptRef: null,
+      contextPageRef,
     };
     const metadata = {
       source: "valkyr-swarm-mcp",
       controlSurface: "mcp",
-      protectedAction,
-      approvalReceiptRef: args.approvalReceiptRef ?? null,
+      protectedAction: false,
+      approvalReceiptRef: null,
     };
     return this.request("/swarm-ops/command", {
       method: "POST",
@@ -215,6 +253,8 @@ class ValkyrSwarmClient {
 async function callTool(client, name, args = {}) {
   if (name === "swarm_status") return client.status();
   if (name === "swarm_agents_snapshot") return client.agentsSnapshot();
+  if (name === "swarm_agent_status") return client.agentStatus(args.agentId);
+  if (name === "swarm_graph") return client.graph();
   if (name === "swarm_command_status") return client.commandStatus(args.commandId);
   if (name === "swarm_dispatch") return client.dispatch(args);
   throw new Error(`Unknown tool: ${name}`);
@@ -275,4 +315,4 @@ function runStdio(client = new ValkyrSwarmClient()) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) runStdio();
 
-export { PROTECTED_ACTIONS, TOOLS, ValkyrSwarmClient, callTool, handleMessage, safeIdentifier, textResult };
+export { PROTECTED_ACTIONS, TOOLS, ValkyrSwarmClient, boundedString, callTool, handleMessage, safeIdentifier, textResult };

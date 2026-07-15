@@ -20,13 +20,17 @@ for (const name of [...FILES, ...DIRECTORIES]) {
 }
 
 for (const relative of [
+  "scripts/package-valkyr-swarm",
   "scripts/swarm-claude-install",
   "scripts/swarm-agent.mjs",
   "scripts/swarm-activate.mjs",
+  "scripts/swarm-auth.mjs",
+  "scripts/swarm-doctor.mjs",
   "scripts/swarm-login.mjs",
   "scripts/swarm-openclaw-bootstrap.mjs",
   "scripts/swarm-service.mjs",
   "scripts/sync-plugin.mjs",
+  "scripts/verify-distribution.mjs",
 ]) {
   fs.chmodSync(path.join(TARGET, relative), 0o755);
 }

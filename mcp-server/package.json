@@ -1,6 +1,6 @@
 {
   "name": "@valkyrlabs/valkyr-swarm-mcp-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tenant-scoped MCP tools for Valkyr SWARM agents and governed commands.",
   "type": "module",
   "main": "index.js",
@@ -11,5 +11,5 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "UNLICENSED"
+  "license": "SEE LICENSE IN ../LICENSE"
 }

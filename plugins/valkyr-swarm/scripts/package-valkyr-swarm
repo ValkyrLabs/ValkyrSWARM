@@ -10,7 +10,7 @@ command -v zip >/dev/null 2>&1 || { echo "zip is required" >&2; exit 1; }
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 cp -R "$ROOT/plugins/valkyr-swarm" "$tmp/valkyr-swarm"
-find "$tmp/valkyr-swarm" -type f -exec touch -t 198001010000 {} +
+find "$tmp/valkyr-swarm" -exec touch -t 198001010000 {} +
 rm -f "$OUT"
-(cd "$tmp" && zip -X -q -r "$OUT" valkyr-swarm)
+(cd "$tmp" && find valkyr-swarm -print | LC_ALL=C sort | zip -X -q "$OUT" -@)
 echo "Packaged $OUT"

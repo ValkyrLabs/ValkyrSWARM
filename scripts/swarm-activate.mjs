@@ -86,6 +86,9 @@ function parseCapabilities(value, runtime) {
     : [...(DEFAULT_CAPABILITIES[runtime] ?? DEFAULT_CAPABILITIES.agent)];
   const unique = [...new Set(capabilities)];
   if (unique.length === 0) throw new Error("At least one capability is required");
+  for (const capability of unique) {
+    if (capability.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(capability)) throw new Error(`Capability contains unsupported characters: ${capability}`);
+  }
   return unique;
 }
 
@@ -213,6 +216,12 @@ function selfTest() {
   if (target.config.machineId !== "example-host") throw new Error("Machine normalization failed");
   if (target.config.agents[0].agentId !== "codex-example-host") throw new Error("Agent derivation failed");
   if (target.apiBase !== DEFAULT_API_BASE) throw new Error("Default API base failed");
+  try {
+    parseCapabilities("workflow.debug,header\ninjection", "codex");
+    throw new Error("Unsafe capability was accepted");
+  } catch (error) {
+    if (String(error?.message ?? error) === "Unsafe capability was accepted") throw error;
+  }
   if (prior === undefined) delete process.env.VALKYR_SWARM_RUNTIME;
   else process.env.VALKYR_SWARM_RUNTIME = prior;
   process.stdout.write("Valkyr SWARM activation self-test passed\n");

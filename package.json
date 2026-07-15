@@ -1,0 +1,18 @@
+{
+  "name": "@valkyrlabs/valkyr-swarm",
+  "version": "0.2.0",
+  "description": "Portable tenant-scoped SWARM plugin, skill, MCP server, and governed agent runtime.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "doctor": "node scripts/swarm-doctor.mjs --live",
+    "package": "scripts/package-valkyr-swarm",
+    "sync": "node scripts/sync-plugin.mjs",
+    "test": "tests/test-runtime.sh && node --test test/*.test.js mcp-server/test/*.test.js",
+    "verify": "node scripts/verify-distribution.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}

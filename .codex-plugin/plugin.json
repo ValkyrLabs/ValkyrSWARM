@@ -1,7 +1,7 @@
 {
   "name": "valkyr-swarm",
-  "version": "0.1.0",
-  "description": "Tenant-scoped SWARM installation, agent runtime, receipts, and MCP tools for Valkyr Labs agents.",
+  "version": "0.2.0+codex.20260715025125",
+  "description": "Install, diagnose, visualize, and operate tenant-scoped Valkyr SWARM agents with governed receipts.",
   "author": {
     "name": "Valkyr Labs Inc.",
     "email": "support@valkyrlabs.com",
@@ -24,11 +24,15 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Valkyr SWARM",
-    "shortDescription": "Install and operate tenant-scoped agent swarms",
-    "longDescription": "Valkyr SWARM lets Claude Code, Codex, OpenClaw, ValorIDE, and other agents authenticate with a Valkyr Labs account, join the account's tenant-isolated SWARM, heartbeat continuously, receive governed commands, and expose safe SWARM operations through MCP. Protected outbound sends, production deployments, and merges remain human-gated.",
+    "shortDescription": "Install, diagnose, and operate tenant SWARM agents",
+    "longDescription": "Valkyr SWARM lets Claude Code, Codex, OpenClaw, ValorIDE, and other agents authenticate with a Valkyr Labs account, join the account's tenant-isolated SWARM, heartbeat continuously, diagnose local and live health, inspect graph topology and agent detail, receive capability-bounded commands, and expose governed receipts through MCP. Protected outbound sends, production deployments, and merges fail closed outside the canonical human-approval surface.",
     "developerName": "Valkyr Labs Inc.",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://valkyrlabs.com/",
     "privacyPolicyURL": "https://valkyrlabs.com/privacy-policy",
     "termsOfServiceURL": "https://valkyrlabs.com/terms",
@@ -37,8 +41,8 @@
     "brandColor": "#0B6F8F",
     "defaultPrompt": [
       "Join this agent to my Valkyr SWARM.",
-      "Show the healthy agents in my tenant SWARM.",
-      "Inspect a governed SWARM command receipt."
+      "Show my SWARM graph and inspect an agent.",
+      "Diagnose this agent and verify its latest receipt."
     ]
   }
 }

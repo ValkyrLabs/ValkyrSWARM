@@ -28,6 +28,7 @@ test("MCP initialize and tool discovery expose the bounded SWARM surface", async
   const client = {};
   const initialized = await handleMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, client);
   assert.equal(initialized.result.serverInfo.name, "valkyr-swarm");
+  assert.equal(initialized.result.serverInfo.version, "0.2.0");
   const listed = await handleMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, client);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), TOOLS.map((tool) => tool.name));
 });
@@ -37,7 +38,11 @@ test("protected dispatch fails closed without a human approval receipt", async (
   const client = new ValkyrSwarmClient({ env: { VALKYR_AUTH_TOKEN: "test-token" } });
   await assert.rejects(
     client.dispatch({ targetAgentId: "builder", action: "merge", instruction: "Merge it" }),
-    /separately correlated human approval receipt/,
+    /canonical human-approval control surface/,
+  );
+  await assert.rejects(
+    client.dispatch({ targetAgentId: "builder", action: "merge", instruction: "Merge it", approvalReceiptRef: "prompt-supplied" }),
+    /portable MCP dispatch fails closed/,
   );
 });
 
@@ -65,7 +70,43 @@ test("safe dispatch targets one explicit agent and never accepts tenant identity
   assert.equal(captured.body.message.toSwarm.instanceId, "codex-reviewer");
   assert.equal(captured.body.message.payload.action, "workflow.debug");
   assert.equal(JSON.stringify(captured.body).includes("tenantId"), false);
+  assert.equal(captured.body.message.payload.metadata.includes('"protectedAction":false'), true);
   assert.match(captured.headers.Authorization, /^Bearer /);
+});
+
+test("agent detail and graph remain tenant-derived read surfaces", async () => {
+  const paths = [];
+  const client = new ValkyrSwarmClient({
+    env: { VALKYR_AUTH_TOKEN: "test-token" },
+    fetchImpl: async (url) => {
+      paths.push(new URL(url).pathname);
+      if (url.endsWith("/swarm/agents/snapshot")) {
+        return new Response(JSON.stringify({ registry: { reviewer: { runtime: "codex", status: "healthy" } } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ nodes: [], edges: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  assert.equal((await client.agentStatus("reviewer")).status, "healthy");
+  assert.deepEqual(await client.graph(), { nodes: [], edges: [] });
+  assert.deepEqual(paths, ["/v1/swarm/agents/snapshot", "/v1/swarm-ops/graph"]);
+});
+
+test("dispatch validates bounded input even when called outside MCP schema validation", async () => {
+  const client = new ValkyrSwarmClient({ env: { VALKYR_AUTH_TOKEN: "test-token" } });
+  await assert.rejects(
+    client.dispatch({ targetAgentId: "reviewer", action: "workflow.debug", instruction: "   " }),
+    /instruction must not be empty/,
+  );
+  await assert.rejects(
+    client.dispatch({ targetAgentId: "reviewer", action: "workflow.debug", instruction: "x".repeat(24_001) }),
+    /instruction exceeds 24000 characters/,
+  );
 });
 
 test("an expired session renews once from reusable credentials", async () => {

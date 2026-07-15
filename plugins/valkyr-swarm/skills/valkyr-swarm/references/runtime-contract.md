@@ -16,6 +16,8 @@ The runtime reloads Keychain or token-file authentication on every reconnect. An
 
 The bridge uses the canonical ValkyrAI `/swarm` STOMP endpoint. It registers each agent, refreshes heartbeats, subscribes to its private command queue and the existing broadcast topic, and writes ACK/NACK lifecycle receipts through `/app/command`.
 
+A command is executable only when `targetInstanceId` exactly matches the registered agent ID and its action exactly matches an advertised capability. Missing-target broadcasts are ignored; undeclared capabilities are NACKed. Manual config values used in protocol headers must be safe identifiers.
+
 The runtime deduplicates completed command IDs and returns the cached terminal receipt for replays.
 
 ## Supervision
@@ -26,4 +28,8 @@ The runtime deduplicates completed command IDs and returns the cached terminal r
 
 ## Protected actions
 
-`outbound.send`, `production.deploy`, and `merge` are denied by the local bridge. MCP dispatch additionally refuses them without a separately correlated human approval receipt. Capability advertisement never constitutes approval.
+`outbound.send`, `production.deploy`, and `merge` are denied by the local bridge and portable MCP. Because the live schema does not expose a general approval-receipt validation endpoint to the portable client, protected work must use the canonical server-validated human approval control surface. A prompt-supplied receipt reference and capability advertisement never constitute approval.
+
+## Completion evidence
+
+`node scripts/swarm-doctor.mjs --live` is the canonical post-activation check. It validates private local state, secure auth availability, receipt hygiene and freshness, supervisor state, and exact tenant-registry presence without printing secrets.

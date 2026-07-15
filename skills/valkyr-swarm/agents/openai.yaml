@@ -1,4 +1,7 @@
 interface:
   display_name: "Valkyr SWARM"
-  short_description: "Install and operate tenant-scoped SWARM agents"
-  default_prompt: "Use $valkyr-swarm to join this agent to my tenant SWARM."
+  short_description: "Install, diagnose, and operate tenant SWARM agents"
+  icon_small: "./assets/valkyrlabs.svg"
+  icon_large: "./assets/valkyrlabs.svg"
+  brand_color: "#0B6F8F"
+  default_prompt: "Use $valkyr-swarm to join this agent, verify its health, and inspect my tenant SWARM graph."

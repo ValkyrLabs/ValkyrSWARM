@@ -1,0 +1,36 @@
+name: Valkyr SWARM CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Runtime, MCP, and mirror tests
+        run: npm test
+      - name: Assert committed plugin mirror parity
+        run: git diff --exit-code -- plugins/valkyr-swarm
+      - name: Deterministic package check
+        shell: bash
+        run: |
+          scripts/package-valkyr-swarm
+          first="$(shasum -a 256 valkyr-swarm.skill | awk '{print $1}')"
+          scripts/package-valkyr-swarm
+          second="$(shasum -a 256 valkyr-swarm.skill | awk '{print $1}')"
+          test "$first" = "$second"
+          unzip -t valkyr-swarm.skill

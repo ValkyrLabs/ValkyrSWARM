@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "valkyr-swarm-mcp-tools/2.0",
+  "approvalBoundary": "Protected actions fail closed in the portable MCP and require canonical server-validated human approval.",
+  "protectedActions": ["outbound.send", "production.deploy", "merge"],
+  "tools": [
+    "swarm_status",
+    "swarm_agents_snapshot",
+    "swarm_agent_status",
+    "swarm_graph",
+    "swarm_command_status",
+    "swarm_dispatch"
+  ]
+}

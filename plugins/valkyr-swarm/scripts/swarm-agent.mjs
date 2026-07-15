@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import {
   buildOpenClawAgentArgs,
   buildOpenClawPrompt,
@@ -21,6 +22,10 @@ import {
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
 const DEFAULT_DURATION_SECONDS = 72 * 60 * 60;
+const PACKAGE_VERSION = "0.2.0";
+const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
+const MAX_IDENTIFIER_LENGTH = 160;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 
 function usage(exitCode = 0) {
@@ -145,11 +150,22 @@ function normalizeWebSocketUrl(value) {
   if (!['ws:', 'wss:'].includes(url.protocol)) {
     throw new Error(`Unsupported SWARM URL protocol: ${url.protocol}`);
   }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("SWARM URL must not contain credentials, query parameters, or fragments");
+  }
   let path = url.pathname.replace(/\/+$/, "");
   if (path.endsWith("/v1")) path = path.slice(0, -3);
   if (!path.endsWith("/swarm")) path = `${path}/swarm`;
   url.pathname = path.replace(/\/+/g, "/");
   return url.toString();
+}
+
+function safeIdentifier(value, label) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized || normalized.length > MAX_IDENTIFIER_LENGTH || !SAFE_IDENTIFIER.test(normalized)) {
+    throw new Error(`${label} contains unsupported characters`);
+  }
+  return normalized;
 }
 
 function stompFrame(command, headers = {}, body = "") {
@@ -193,31 +209,50 @@ function parseWireCommand(body) {
 }
 
 function validateConfig(config) {
-  if (!config || typeof config !== "object") throw new Error("Pilot config must be an object");
-  if (!config.machineId) throw new Error("Pilot config requires machineId");
+  if (!config || typeof config !== "object") throw new Error("SWARM config must be an object");
+  safeIdentifier(config.machineId, "machineId");
   if (!Array.isArray(config.agents) || config.agents.length === 0) {
-    throw new Error("Pilot config requires at least one agent");
+    throw new Error("SWARM config requires at least one agent");
   }
   const seen = new Set();
   for (const agent of config.agents) {
     if (!agent.agentId || !agent.runtime) throw new Error("Each pilot agent requires agentId and runtime");
+    safeIdentifier(agent.agentId, "agentId");
+    safeIdentifier(agent.runtime, "runtime");
     if (seen.has(agent.agentId)) throw new Error(`Duplicate pilot agentId: ${agent.agentId}`);
     seen.add(agent.agentId);
     if (!Array.isArray(agent.capabilities) || agent.capabilities.length === 0) {
-      throw new Error(`Pilot agent ${agent.agentId} requires capabilities`);
+      throw new Error(`SWARM agent ${agent.agentId} requires capabilities`);
     }
+    for (const capability of agent.capabilities) safeIdentifier(capability, `capability for ${agent.agentId}`);
     validateRuntimeAdapter(agent);
     const capacity = Number(agent.capacity ?? 1);
-    if (!Number.isInteger(capacity) || capacity < 1) {
-      throw new Error(`Pilot agent ${agent.agentId} capacity must be a positive integer`);
+    if (!Number.isInteger(capacity) || capacity < 1 || capacity > 100) {
+      throw new Error(`SWARM agent ${agent.agentId} capacity must be an integer from 1 to 100`);
     }
   }
+}
+
+function commandDisposition(wire, agent) {
+  if (!wire.targetInstanceId) return { disposition: "ignore", reason: "missing_target_instance_id" };
+  if (wire.targetInstanceId !== agent.agentId) return { disposition: "ignore", reason: "target_mismatch" };
+  const action = String(wire.action ?? "").trim();
+  if (PROTECTED_ACTIONS.has(action.toLowerCase())) {
+    return { disposition: "reject", protectedAction: true, reason: "protected_action_requires_canonical_human_approval" };
+  }
+  if (!agent.capabilities.includes(action)) {
+    return { disposition: "reject", protectedAction: false, reason: "action_not_advertised_by_agent" };
+  }
+  return { disposition: "accept", protectedAction: false };
 }
 
 class EvidenceLog {
   constructor(receiptPath) {
     this.path = receiptPath ? expandPath(receiptPath) : null;
-    if (this.path) fs.mkdirSync(path.dirname(this.path), { recursive: true, mode: 0o700 });
+    if (this.path) {
+      fs.mkdirSync(path.dirname(this.path), { recursive: true, mode: 0o700 });
+      if (fs.existsSync(this.path)) fs.chmodSync(this.path, 0o600);
+    }
   }
 
   record(event, details = {}) {
@@ -228,7 +263,7 @@ class EvidenceLog {
   }
 }
 
-class PilotAgent {
+class SwarmAgent {
   constructor({ agent, machineId, tokenProvider, url, heartbeatSeconds, evidence }) {
     this.agent = agent;
     this.machineId = machineId;
@@ -385,8 +420,7 @@ class PilotAgent {
         approvalPolicy: "human-approval-required",
         executionAdapter: this.agent.execution?.adapter ?? "receipt-only",
         receiptOnly: !this.agent.execution,
-        testMode: !this.agent.execution,
-        version: this.agent.version ?? "valkyr-swarm/0.1",
+        version: this.agent.version ?? `valkyr-swarm/${PACKAGE_VERSION}`,
       },
     }));
   }
@@ -408,7 +442,6 @@ class PilotAgent {
       activeTasks: this.inFlightCommands.size,
       executionAdapter: this.agent.execution?.adapter ?? "receipt-only",
       receiptOnly: !this.agent.execution,
-      testMode: !this.agent.execution,
     }));
     this.evidence.record("heartbeat_sent", { agentId: this.agent.agentId, machineId: this.machineId });
   }
@@ -435,6 +468,10 @@ class PilotAgent {
   }
 
   onMessage(body) {
+    if (Buffer.byteLength(String(body), "utf8") > MAX_COMMAND_BODY_BYTES) {
+      this.evidence.record("command_ignored", { agentId: this.agent.agentId, reason: "command_payload_too_large" });
+      return;
+    }
     let wire;
     try {
       wire = parseWireCommand(body);
@@ -445,27 +482,19 @@ class PilotAgent {
       });
       return;
     }
-    if (wire.targetInstanceId && wire.targetInstanceId !== this.agent.agentId) return;
-    if (!wire.commandId) {
-      this.evidence.record("command_ignored", { agentId: this.agent.agentId, reason: "missing_command_id" });
+    if (typeof wire.commandId !== "string" || !SAFE_IDENTIFIER.test(wire.commandId) || wire.commandId.length > MAX_IDENTIFIER_LENGTH) {
+      this.evidence.record("command_ignored", { agentId: this.agent.agentId, reason: "invalid_command_id" });
       return;
     }
 
-    const protectedAction = PROTECTED_ACTIONS.has(String(wire.action).toLowerCase());
-    if (protectedAction) {
-      this.sendCommandResponse(wire, {
-        type: "NACK",
-        status: "rejected",
-        reason: "protected_action_requires_human_approval",
-        result: { executed: false, receiptOnly: true },
-      });
-      this.evidence.record("command_nacked", {
+    const route = commandDisposition(wire, this.agent);
+    if (route.disposition === "ignore") {
+      this.evidence.record("command_ignored", {
         action: wire.action,
         agentId: this.agent.agentId,
         commandId: wire.commandId,
-        executed: false,
-        protectedAction: true,
-        traceId: wire.trace?.traceId,
+        reason: route.reason,
+        targetInstanceId: wire.targetInstanceId ?? null,
       });
       return;
     }
@@ -490,19 +519,41 @@ class PilotAgent {
       return;
     }
 
+    if (route.disposition === "reject") {
+      const rejected = {
+        type: "NACK",
+        status: "rejected",
+        reason: route.reason,
+        result: { executed: false, receiptOnly: true },
+      };
+      this.rememberCompleted(wire.commandId, rejected);
+      this.sendCommandResponse(wire, rejected);
+      this.evidence.record("command_nacked", {
+        action: wire.action,
+        agentId: this.agent.agentId,
+        commandId: wire.commandId,
+        executed: false,
+        protectedAction: route.protectedAction,
+        reason: route.reason,
+        traceId: wire.trace?.traceId,
+      });
+      return;
+    }
+
     if (!this.agent.execution) {
-      this.sendCommandResponse(wire, {
+      const received = {
         type: "ACK",
         status: "pilot_received",
-        result: { executed: false, testMode: true, receiptOnly: true },
-      });
+        result: { executed: false, receiptOnly: true },
+      };
+      this.rememberCompleted(wire.commandId, received);
+      this.sendCommandResponse(wire, received);
       this.evidence.record("command_acked", {
         action: wire.action,
         agentId: this.agent.agentId,
         commandId: wire.commandId,
         executed: false,
         protectedAction: false,
-        testMode: true,
         traceId: wire.trace?.traceId,
       });
       return;
@@ -651,7 +702,7 @@ async function selfTest() {
     `Authorization: Bearer ${fakeJwt} token=super-secret`,
   );
   if (secretError.includes("eyJabcdefgh") || secretError.includes("super-secret")) {
-    throw new Error("Pilot evidence error redaction failed");
+    throw new Error("SWARM evidence error redaction failed");
   }
   const frame = stompFrame("SEND", { destination: "/app/command" }, '{"ok":true}');
   const parsed = parseStompFrame(frame);
@@ -672,6 +723,33 @@ async function selfTest() {
   }
   for (const action of ["outbound.send", "production.deploy", "merge"]) {
     if (!PROTECTED_ACTIONS.has(action)) throw new Error(`Missing protected action: ${action}`);
+  }
+  const routingAgent = { agentId: "agent-1", capabilities: ["content.research"] };
+  if (commandDisposition(wire, routingAgent).disposition !== "accept") {
+    throw new Error("Explicit target and advertised capability must be accepted");
+  }
+  if (commandDisposition({ ...wire, targetInstanceId: null }, routingAgent).reason !== "missing_target_instance_id") {
+    throw new Error("Missing-target broadcast commands must fail closed");
+  }
+  if (commandDisposition({ ...wire, action: "workflow.debug" }, routingAgent).reason !== "action_not_advertised_by_agent") {
+    throw new Error("Undeclared actions must fail closed");
+  }
+  if (commandDisposition({ ...wire, action: "merge" }, routingAgent).protectedAction !== true) {
+    throw new Error("Protected actions must fail closed");
+  }
+  if (commandDisposition({ ...wire, commandId: "x".repeat(MAX_IDENTIFIER_LENGTH + 1) }, routingAgent).disposition !== "accept") {
+    throw new Error("Command disposition must remain independent from command ID validation");
+  }
+  for (const unsafeUrl of [
+    "wss://operator:secret@api-0.valkyrlabs.com/swarm",
+    "wss://api-0.valkyrlabs.com/swarm?token=secret",
+  ]) {
+    try {
+      normalizeWebSocketUrl(unsafeUrl);
+      throw new Error(`Unsafe SWARM URL was accepted: ${unsafeUrl}`);
+    } catch (error) {
+      if (String(error?.message ?? error).startsWith("Unsafe SWARM URL was accepted:")) throw error;
+    }
   }
   const runtimeAgent = {
     agentId: "valklaw-builder",
@@ -709,7 +787,12 @@ async function main() {
   if (options.selfTest) return selfTest();
   if (!options.config) usage(2);
 
-  const config = JSON.parse(fs.readFileSync(options.config, "utf8"));
+  const configPath = expandPath(options.config);
+  const configStat = fs.statSync(configPath);
+  if (process.platform !== "win32" && (configStat.mode & 0o077) !== 0) {
+    throw new Error(`SWARM config permissions must be 0600: ${configPath}`);
+  }
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   validateConfig(config);
   const configuredToken = options.token
     ?? process.env.VALKYR_AUTH_TOKEN
@@ -757,7 +840,7 @@ async function main() {
   }
 
   const evidence = new EvidenceLog(options.receiptLog);
-  const agents = config.agents.map((agent) => new PilotAgent({
+  const agents = config.agents.map((agent) => new SwarmAgent({
     agent,
     machineId: config.machineId,
     tokenProvider,
@@ -771,7 +854,7 @@ async function main() {
     continuous: options.continuous === true,
     machineId: config.machineId,
     executionEnabledCount: config.agents.filter((agent) => agent.execution).length,
-    testMode: config.agents.every((agent) => !agent.execution),
+    receiptOnlyCount: config.agents.filter((agent) => !agent.execution).length,
     url: new URL(url).origin + new URL(url).pathname,
   });
   agents.forEach((agent) => agent.connect());
@@ -786,12 +869,15 @@ async function main() {
   if (durationSeconds !== null) setTimeout(stop, durationSeconds * 1000).unref();
 }
 
-main().catch((error) => {
-  process.stderr.write(`Valkyr SWARM agent failed: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`Valkyr SWARM agent failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}
 
 export {
+  commandDisposition,
   createTokenProvider,
   normalizeWebSocketUrl,
   parseStompFrame,
