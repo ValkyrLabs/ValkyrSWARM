@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { commandDisposition, normalizeWebSocketUrl, validateConfig } from "../scripts/swarm-agent.mjs";
+import {
+  commandDestinations,
+  commandDisposition,
+  normalizeWebSocketUrl,
+  validateConfig,
+} from "../scripts/swarm-agent.mjs";
 import { forbiddenConfigPaths, readReceiptEvidence } from "../scripts/swarm-doctor.mjs";
 
 test("runtime accepts only exact targets and advertised capabilities", () => {
@@ -14,6 +19,17 @@ test("runtime accepts only exact targets and advertised capabilities", () => {
   assert.equal(commandDisposition({ targetInstanceId: "other", action: "workflow.debug" }, agent).reason, "target_mismatch");
   assert.equal(commandDisposition({ targetInstanceId: "codex-host", action: "code.execute" }, agent).reason, "action_not_advertised_by_agent");
   assert.equal(commandDisposition({ targetInstanceId: "codex-host", action: "merge" }, agent).protectedAction, true);
+});
+
+test("tenant runtimes subscribe only to their exact-target private queue", () => {
+  assert.deepEqual(commandDestinations("codex-host"), [{
+    destination: "/queue/agents/codex-host/commands",
+    id: "private-codex-host",
+  }]);
+  assert.equal(
+    commandDestinations("codex-host").some(({ destination }) => destination === "/topic/agent-commands"),
+    false,
+  );
 });
 
 test("manual configs reject protocol-header injection and excessive capacity", () => {

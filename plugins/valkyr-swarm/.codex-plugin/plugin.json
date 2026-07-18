@@ -1,7 +1,7 @@
 {
   "name": "valkyr-swarm",
-  "version": "0.2.0+codex.20260715025125",
-  "description": "Install, diagnose, visualize, and operate tenant-scoped Valkyr SWARM agents with governed receipts.",
+  "version": "0.3.0+codex.20260717042204",
+  "description": "Activate and operate executable production tenant SWARM agents with realtime websocket and GrayMatter receipts.",
   "author": {
     "name": "Valkyr Labs Inc.",
     "email": "support@valkyrlabs.com",
@@ -25,7 +25,7 @@
   "interface": {
     "displayName": "Valkyr SWARM",
     "shortDescription": "Install, diagnose, and operate tenant SWARM agents",
-    "longDescription": "Valkyr SWARM lets Claude Code, Codex, OpenClaw, ValorIDE, and other agents authenticate with a Valkyr Labs account, join the account's tenant-isolated SWARM, heartbeat continuously, diagnose local and live health, inspect graph topology and agent detail, receive capability-bounded commands, and expose governed receipts through MCP. Protected outbound sends, production deployments, and merges fail closed outside the canonical human-approval surface.",
+    "longDescription": "Valkyr SWARM lets Claude Code, Codex, OpenClaw, ValorIDE, and other agents authenticate with a Valkyr Labs account, activate executable production nodes, heartbeat continuously, receive capability-bounded commands, stream progress and terminal replies over the canonical websocket, persist GrayMatter receipts and shared handoffs, and expose the tenant graph through MCP. Protected outbound sends, production deployments, and merges fail closed outside the canonical human-approval surface.",
     "developerName": "Valkyr Labs Inc.",
     "category": "Productivity",
     "capabilities": [

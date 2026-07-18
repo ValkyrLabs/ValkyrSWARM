@@ -19,10 +19,11 @@ import {
   persistAuthentication,
   readTokenFile,
 } from "./swarm-auth.mjs";
+import { persistCommandReceipt, replayQueuedReceipts } from "./swarm-graymatter.mjs";
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
 const DEFAULT_DURATION_SECONDS = 72 * 60 * 60;
-const PACKAGE_VERSION = "0.2.0";
+const PACKAGE_VERSION = "0.3.0";
 const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
 const MAX_IDENTIFIER_LENGTH = 160;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
@@ -48,9 +49,10 @@ Options:
   --self-test                  Run protocol/guardrail checks without a server
   -h, --help                   Show this help
 
-Agents without an execution adapter acknowledge receipt only. Agents configured
-with the openclaw-agent adapter execute safe commands through the canonical
-OpenClaw Gateway CLI. outbound.send, production.deploy, and merge are always NACKed.
+Agents execute through productized Codex, Claude Code, OpenClaw, or ValorIDE
+runtime adapters and stream progress plus terminal receipts over SWARM. Explicit
+receipt-only agents never execute. outbound.send, production.deploy, and merge
+are always NACKed.
 `);
   process.exit(exitCode);
 }
@@ -131,15 +133,27 @@ function createTokenProvider(
   };
 }
 
-function redactedError(error) {
-  return (error instanceof Error ? error.message : String(error))
+function redactedText(value, limit = 2_000) {
+  return String(value ?? "")
     .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
     .replace(JWT, "[REDACTED_JWT]")
     .replace(
       /(password|secret|token|authorization|api.?key)(\s*[=:]\s*)([^\s,;]+)/gi,
       "$1$2[REDACTED]",
     )
-    .slice(0, 500);
+    .slice(0, limit);
+}
+
+function commandDestinations(agentId) {
+  return [{
+    destination: `/queue/agents/${agentId}/commands`,
+    id: `private-${agentId}`,
+  }];
+}
+
+function redactedError(error) {
+  // SwarmCommandResponse.rejectionCode is generated as varchar(255).
+  return redactedText(error instanceof Error ? error.message : String(error), 240);
 }
 
 function normalizeWebSocketUrl(value) {
@@ -264,8 +278,9 @@ class EvidenceLog {
 }
 
 class SwarmAgent {
-  constructor({ agent, machineId, tokenProvider, url, heartbeatSeconds, evidence }) {
+  constructor({ agent, apiBase, machineId, tokenProvider, url, heartbeatSeconds, evidence }) {
     this.agent = agent;
+    this.apiBase = apiBase;
     this.machineId = machineId;
     this.tokenProvider = tokenProvider;
     this.url = url;
@@ -280,6 +295,8 @@ class SwarmAgent {
     this.inFlightCommands = new Map();
     this.completedCommands = new Map();
     this.forceAuthRefresh = false;
+    this.grayMatterReplayActive = false;
+    this.lastGrayMatterReplayAt = 0;
   }
 
   async connect() {
@@ -347,10 +364,12 @@ class SwarmAgent {
 
   onConnected() {
     this.reconnectAttempt = 0;
-    this.subscribe(`/queue/agents/${this.agent.agentId}/commands`, `private-${this.agent.agentId}`);
-    this.subscribe("/topic/agent-commands", `broadcast-${this.agent.agentId}`);
+    for (const { destination, id } of commandDestinations(this.agent.agentId)) {
+      this.subscribe(destination, id);
+    }
     this.sendRegistration();
     this.startHeartbeat();
+    void this.replayGrayMatterReceipts(true);
     this.evidence.record("connected", {
       agentId: this.agent.agentId,
       machineId: this.machineId,
@@ -444,6 +463,38 @@ class SwarmAgent {
       receiptOnly: !this.agent.execution,
     }));
     this.evidence.record("heartbeat_sent", { agentId: this.agent.agentId, machineId: this.machineId });
+    void this.replayGrayMatterReceipts(false);
+  }
+
+  async replayGrayMatterReceipts(force) {
+    const now = Date.now();
+    if (this.grayMatterReplayActive || (!force && now - this.lastGrayMatterReplayAt < 5 * 60 * 1000)) return;
+    this.grayMatterReplayActive = true;
+    this.lastGrayMatterReplayAt = now;
+    try {
+      const results = await replayQueuedReceipts({
+        agentId: this.agent.agentId,
+        apiBase: this.apiBase,
+        tokenProvider: this.tokenProvider,
+      });
+      for (const result of results) {
+        this.evidence.record(
+          result.status === "persisted" ? "graymatter_receipt_replayed" : "graymatter_receipt_replay_deferred",
+          {
+            agentId: this.agent.agentId,
+            memoryEntryId: result.id ?? null,
+            error: result.error ? redactedError(result.error) : null,
+          },
+        );
+      }
+    } catch (error) {
+      this.evidence.record("graymatter_receipt_replay_deferred", {
+        agentId: this.agent.agentId,
+        error: redactedError(error),
+      });
+    } finally {
+      this.grayMatterReplayActive = false;
+    }
   }
 
   sendCommandResponse(wire, { type, status, reason, result }) {
@@ -465,6 +516,35 @@ class SwarmAgent {
       time: new Date().toISOString(),
     });
     return response;
+  }
+
+  async persistTerminalReceipt(wire, response) {
+    try {
+      const memory = await persistCommandReceipt({
+        agent: this.agent,
+        apiBase: this.apiBase,
+        tokenProvider: this.tokenProvider,
+        wire,
+        response,
+      });
+      const status = memory?.queued ? "queued" : "persisted";
+      this.evidence.record(memory?.queued ? "graymatter_receipt_queued" : "graymatter_receipt_persisted", {
+        agentId: this.agent.agentId,
+        commandId: wire.commandId,
+        memoryEntryId: memory?.id ?? null,
+        error: memory?.error ? redactedError(memory.error) : null,
+        status: response.status,
+      });
+      return { id: memory?.id ?? null, status };
+    } catch (error) {
+      this.evidence.record("graymatter_receipt_degraded", {
+        agentId: this.agent.agentId,
+        commandId: wire.commandId,
+        error: redactedError(error),
+        status: response.status,
+      });
+      return { id: null, status: "degraded" };
+    }
   }
 
   onMessage(body) {
@@ -528,6 +608,7 @@ class SwarmAgent {
       };
       this.rememberCompleted(wire.commandId, rejected);
       this.sendCommandResponse(wire, rejected);
+      void this.persistTerminalReceipt(wire, rejected);
       this.evidence.record("command_nacked", {
         action: wire.action,
         agentId: this.agent.agentId,
@@ -548,6 +629,7 @@ class SwarmAgent {
       };
       this.rememberCompleted(wire.commandId, received);
       this.sendCommandResponse(wire, received);
+      void this.persistTerminalReceipt(wire, received);
       this.evidence.record("command_acked", {
         action: wire.action,
         agentId: this.agent.agentId,
@@ -575,9 +657,42 @@ class SwarmAgent {
       commandId: wire.commandId,
       traceId: wire.trace?.traceId,
     });
-    const execution = executeRuntimeCommand({ agent: this.agent, wire })
-      .then((result) => {
+    let progressSequence = 0;
+    const execution = executeRuntimeCommand({
+      agent: this.agent,
+      wire,
+      onProgress: (progress) => {
+        const response = {
+          type: "ACK",
+          status: "progress",
+          result: {
+            adapter: this.agent.execution.adapter,
+            executed: false,
+            receiptOnly: false,
+            sequence: ++progressSequence,
+            stream: progress.stream,
+            text: redactedText(progress.text),
+          },
+        };
+        this.sendCommandResponse(wire, response);
+        this.evidence.record("command_progress", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          sequence: progressSequence,
+          stream: progress.stream,
+          traceId: wire.trace?.traceId,
+        });
+      },
+    })
+      .then(async (result) => {
         const completed = { type: "ACK", status: "completed", result };
+        const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
+        completed.result = {
+          ...completed.result,
+          grayMatterReceiptRef: memoryReceipt.id ? `MemoryEntry:${memoryReceipt.id}` : null,
+          grayMatterReceiptStatus: memoryReceipt.status,
+        };
         this.rememberCompleted(wire.commandId, completed);
         this.sendCommandResponse(wire, completed);
         this.evidence.record("command_completed", {
@@ -589,7 +704,7 @@ class SwarmAgent {
           traceId: wire.trace?.traceId,
         });
       })
-      .catch((error) => {
+      .catch(async (error) => {
         const failed = {
           type: "NACK",
           status: "failed",
@@ -600,6 +715,9 @@ class SwarmAgent {
             receiptOnly: false,
           },
         };
+        const memoryReceipt = await this.persistTerminalReceipt(wire, failed);
+        failed.result.grayMatterReceiptRef = memoryReceipt.id ? `MemoryEntry:${memoryReceipt.id}` : null;
+        failed.result.grayMatterReceiptStatus = memoryReceipt.status;
         this.rememberCompleted(wire.commandId, failed);
         this.sendCommandResponse(wire, failed);
         this.evidence.record("command_failed", {
@@ -756,6 +874,7 @@ async function selfTest() {
     execution: {
       adapter: "openclaw-agent",
       agentId: "valor",
+      executable: "openclaw",
       timeoutSeconds: 600,
     },
   };
@@ -842,6 +961,7 @@ async function main() {
   const evidence = new EvidenceLog(options.receiptLog);
   const agents = config.agents.map((agent) => new SwarmAgent({
     agent,
+    apiBase,
     machineId: config.machineId,
     tokenProvider,
     url,
@@ -877,6 +997,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 }
 
 export {
+  commandDestinations,
   commandDisposition,
   createTokenProvider,
   normalizeWebSocketUrl,

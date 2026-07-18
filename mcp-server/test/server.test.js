@@ -28,7 +28,7 @@ test("MCP initialize and tool discovery expose the bounded SWARM surface", async
   const client = {};
   const initialized = await handleMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, client);
   assert.equal(initialized.result.serverInfo.name, "valkyr-swarm");
-  assert.equal(initialized.result.serverInfo.version, "0.2.0");
+  assert.equal(initialized.result.serverInfo.version, "0.3.0");
   const listed = await handleMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, client);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), TOOLS.map((tool) => tool.name));
 });
@@ -140,4 +140,29 @@ test("an expired session renews once from reusable credentials", async () => {
   assert.deepEqual(value, { registry: {} });
   assert.equal(loginCount, 1);
   assert.deepEqual(authorizations, ["Bearer expired-token", "Bearer renewed-token"]);
+});
+
+test("MCP persists shared handoffs and queries invariants and receipts through GrayMatter", async () => {
+  const requests = [];
+  const client = new ValkyrSwarmClient({
+    env: { VALKYR_AUTH_TOKEN: "test-token" },
+    fetchImpl: async (url, options) => {
+      requests.push({ url, body: JSON.parse(options.body) });
+      return new Response(JSON.stringify({ id: "memory-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  await client.handoffWrite({ text: "Continue the verified gate", tags: ["p1"] });
+  await client.invariantsQuery({ query: "binding SWARM invariant", limit: 5 });
+  await client.receiptsQuery({ query: "cmd-1", limit: 5 });
+  assert.deepEqual(requests.map((request) => new URL(request.url).pathname), [
+    "/v1/MemoryEntry/write",
+    "/v1/MemoryEntry/query",
+    "/v1/MemoryEntry/query",
+  ]);
+  assert.equal(requests[0].body.sourceChannel, "valkyr-swarm:handoff");
+  assert.equal(requests[1].body.type, "decision");
+  assert.equal(requests[2].body.source, "valkyr-swarm:receipts");
 });

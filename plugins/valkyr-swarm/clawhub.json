@@ -1,6 +1,6 @@
 {
   "name": "valkyr-swarm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Join OpenClaw and peer agents to a tenant-scoped Valkyr SWARM.",
   "skill": "skills/valkyr-swarm/SKILL.md",
   "repository": "https://github.com/ValkyrLabs/ValkyrSWARM"

@@ -16,7 +16,7 @@ VALKYR_USERNAME="$USERNAME" VALKYR_PASSWORD="$PASSWORD" \
   node scripts/swarm-activate.mjs
 ```
 
-Activation derives the runtime, machine ID, agent ID, capabilities, tenant context, secure session storage, and native service configuration. Override only when the operator supplies a stable identity:
+Activation derives the runtime, machine ID, agent ID, executable adapter, capabilities, tenant context, secure session storage, and native service configuration. It targets production api-0 and merges repeated runtime activations into one supervised machine config. Override only when the operator supplies a stable identity:
 
 ```bash
 VALKYR_USERNAME="$USERNAME" VALKYR_PASSWORD="$PASSWORD" \
@@ -36,7 +36,7 @@ VALKYR_USERNAME="$USERNAME" VALKYR_PASSWORD="$PASSWORD" \
     --openclaw-agent-id valor
 ```
 
-Without `--openclaw-agent-id`, the agent is receipt-only and never executes commands locally.
+Codex, Claude Code, OpenClaw, ValorIDE, and Valklaw activation must auto-discover an executable runtime. Activation fails closed when it cannot; `--receipt-only` is an explicit operator choice, never the normal fallback. Non-production endpoints require `--test-mode` and never count as durable node activation.
 
 After activation, prove local and tenant health:
 
@@ -52,6 +52,8 @@ Treat `status: ready` plus a healthy exact agent match as the completion gate. R
 - Read the redacted JSONL receipt path returned by activation.
 - Use `swarm_status` for tenant readiness, `swarm_agents_snapshot` for registry state, `swarm_agent_status` for one detail card, and `swarm_graph` for topology.
 - Use `swarm_command_status` to verify the durable ACK/NACK receipt after dispatch.
+- Use `swarm_handoff_write` for shared GrayMatter handoffs, `swarm_invariants_query` before planning, and `swarm_receipts_query` for runtime command evidence.
+- Executable nodes send `started`, bounded `progress`, and terminal `completed`/`failed` lifecycle frames over the canonical websocket and persist a GrayMatter artifact receipt.
 - Target exactly one agent for dispatch. Never broadcast implicitly.
 - Dispatch only an action advertised in the target agent's capabilities.
 

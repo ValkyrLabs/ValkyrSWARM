@@ -14,11 +14,15 @@ The runtime reloads Keychain or token-file authentication on every reconnect. An
 
 ## Transport
 
-The bridge uses the canonical ValkyrAI `/swarm` STOMP endpoint. It registers each agent, refreshes heartbeats, subscribes to its private command queue and the existing broadcast topic, and writes ACK/NACK lifecycle receipts through `/app/command`.
+The bridge uses the canonical ValkyrAI `/swarm` STOMP endpoint. It registers each agent, refreshes heartbeats, subscribes only to its exact-target private command queue, and writes ACK/NACK lifecycle receipts through `/app/command`. The operator-only broadcast topic is deliberately excluded from product agent subscriptions.
 
 A command is executable only when `targetInstanceId` exactly matches the registered agent ID and its action exactly matches an advertised capability. Missing-target broadcasts are ignored; undeclared capabilities are NACKed. Manual config values used in protocol headers must be safe identifiers.
 
 The runtime deduplicates completed command IDs and returns the cached terminal receipt for replays.
+
+Executable runtime adapters are productized for Codex, Claude Code, OpenClaw, and ValorIDE/Valor. They stream bounded, redacted progress frames before one terminal ACK/NACK. Terminal rejection text is bounded for generated persistence, and each terminal outcome is written to GrayMatter under `valkyr-swarm:receipts`. Credit-gated or temporarily unavailable writes enter a secret-free mode-0600 replay queue under `~/.config/valkyr-swarm/graymatter-replay`; supervised agents retry with fresh authentication and remove each replay record only after GrayMatter confirms persistence. The websocket terminal outcome reports `queued` or `degraded` honestly and is never changed into a false success.
+
+Repeated activation on one physical machine merges stable agent IDs into one private machine config and one supervised bridge. Normal durable activation accepts only production `https://api-0.valkyrlabs.com/v1`; non-production endpoints require explicit test mode.
 
 ## Supervision
 

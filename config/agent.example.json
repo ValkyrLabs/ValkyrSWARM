@@ -10,7 +10,14 @@
       "agentId": "codex-example-host",
       "runtime": "codex",
       "capacity": 1,
-      "capabilities": ["pr.review", "workflow.debug"]
+      "capabilities": ["pr.review", "workflow.debug"],
+      "execution": {
+        "adapter": "codex-cli",
+        "agentId": "codex-example-host",
+        "executable": "codex",
+        "workingDirectory": "~/workspace",
+        "timeoutSeconds": 600
+      }
     }
   ]
 }

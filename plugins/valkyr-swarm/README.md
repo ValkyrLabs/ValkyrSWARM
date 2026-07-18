@@ -34,9 +34,13 @@ The command:
 4. stores the session and reusable login securely in macOS Keychain or separate mode-0600 files;
 5. writes a private mode-0600 agent config without tenant or secret fields;
 6. installs a user LaunchAgent on macOS or systemd-user service on Linux;
-7. registers, heartbeats, receives commands, and emits durable ACK/NACK receipts.
+7. auto-discovers the local Codex, Claude Code, OpenClaw, or ValorIDE CLI and enables its productized execution adapter;
+8. registers every configured node against production api-0, heartbeats, receives commands, streams progress, and emits terminal ACK/NACK receipts;
+9. stores terminal command receipts and shared handoffs in GrayMatter. Credit-gated or temporarily unavailable terminal writes enter a secret-free mode-0600 replay queue under `~/.config/valkyr-swarm/graymatter-replay` and retry automatically.
 
 Activation never accepts tenant, organization, or owner identity from the caller. Those values come only from the authenticated server session.
+
+Repeated activation on one machine merges stable runtime nodes into the same private config and supervised bridge. Normal activation rejects non-production endpoints; `--test-mode` is limited to isolated test fixtures. Use `--receipt-only` only when the operator intentionally wants a node that cannot execute.
 
 Use `--foreground` for a runtime-owned process or a platform without launchd/systemd-user. Use `--dry-run` to inspect the non-secret activation plan.
 
@@ -52,7 +56,7 @@ The doctor checks Node compatibility, private config permissions, secure reusabl
 
 ### Codex and ValorIDE
 
-Install the `valkyr-swarm` Codex plugin from this repository's marketplace, or run activation directly. The bundled `.mcp.json` exposes the local MCP server.
+Install the `valkyr-swarm` Codex plugin from this repository's marketplace, or run activation directly. Codex activation discovers `codex exec`; ValorIDE activation discovers the shipped `valor` CLI. Both execute exact advertised non-protected capabilities and stream bounded progress over SWARM.
 
 ### Claude Code
 
@@ -64,7 +68,7 @@ scripts/swarm-claude-install
 
 ### OpenClaw
 
-Receipt-only registration needs no OpenClaw-specific option. To enable governed safe execution through an existing OpenClaw Gateway agent:
+Activation auto-discovers OpenClaw. Supply a stable local Gateway agent identity only when it cannot be derived from the runtime environment:
 
 ```bash
 VALKYR_USERNAME='user@example.com' VALKYR_PASSWORD='secret' \
@@ -80,6 +84,9 @@ node scripts/swarm-openclaw-bootstrap.mjs bootstrap \
 - `swarm_graph`
 - `swarm_command_status`
 - `swarm_dispatch`
+- `swarm_handoff_write`
+- `swarm_invariants_query`
+- `swarm_receipts_query`
 
 Tenant IDs are not MCP arguments. Every tool uses the authenticated session's server-resolved tenant context. Dispatch targets exactly one agent and executable agents reject actions they did not advertise as capabilities.
 
@@ -93,7 +100,7 @@ Outbound sends, production deployments, and merges remain human-gated. The porta
 - Linux uses a systemd user unit under `~/.config/systemd/user`.
 - Other platforms run in the foreground under the calling runtime.
 - Config and non-Keychain auth files are mode `0600`.
-- JSONL receipts are redacted, mode `0600`, and include connection, heartbeat, command lifecycle, trace, and execution state.
+- JSONL receipts are redacted, mode `0600`, and include connection, heartbeat, realtime progress, terminal command lifecycle, trace, GrayMatter receipt state, and execution state.
 
 ## Development
 

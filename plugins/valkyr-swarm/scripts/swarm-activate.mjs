@@ -34,7 +34,7 @@ const DEFAULT_CAPABILITIES = {
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: node scripts/swarm-activate.mjs [options]\n\nAuthenticates, creates a tenant SWARM agent config, and starts its supervised bridge.\nFor unattended first use, set VALKYR_USERNAME and VALKYR_PASSWORD.\n\nOptions:\n  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw\n  --agent-id <id>             Default <runtime>-<machine-id>\n  --machine-id <id>           Default normalized hostname\n  --capabilities <csv>        Runtime-safe defaults when omitted\n  --capacity <n>              Default 1\n  --api-base <url>            Default https://api-0.valkyrlabs.com/v1\n  --config <path>             Default ~/.config/valkyr-swarm/agent-<machine-id>.json\n  --receipt-log <path>        Default platform log directory\n  --openclaw-agent-id <id>    Enable the verified OpenClaw Gateway adapter\n  --foreground                Run attached instead of installing supervision\n  --no-service                Create/authenticate only; do not start\n  --dry-run                   Print the non-secret plan without login or writes\n  --self-test                 Validate discovery/config contracts offline\n  -h, --help                  Show this help\n\nProtected outbound.send, production.deploy, and merge actions remain denied locally.\n`);
+  stream.write(`Usage: node scripts/swarm-activate.mjs [options]\n\nAuthenticates, creates or updates a production tenant SWARM config, and starts its supervised bridge.\nFor unattended first use, set VALKYR_USERNAME and VALKYR_PASSWORD.\n\nOptions:\n  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw\n  --agent-id <id>             Default <runtime>-<machine-id>\n  --machine-id <id>           Default normalized hostname\n  --capabilities <csv>        Runtime-safe defaults when omitted\n  --capacity <n>              Default 1\n  --api-base <url>            Production api-0; non-production requires --test-mode\n  --config <path>             Default ~/.config/valkyr-swarm/agent-<machine-id>.json\n  --receipt-log <path>        Default platform log directory\n  --runtime-agent-id <id>     Local runtime identity (OpenClaw/ValorIDE/etc.)\n  --runtime-executable <path> Override auto-discovered runtime CLI\n  --workspace <path>          Runtime working directory\n  --receipt-only              Explicitly disable local execution\n  --replace-agent             Replace, rather than merge, the machine agent set\n  --test-mode                 Allow an isolated non-production endpoint\n  --foreground                Run attached instead of installing supervision\n  --no-service                Create/authenticate only; do not start\n  --dry-run                   Print the non-secret plan without login or writes\n  --self-test                 Validate discovery/config contracts offline\n  -h, --help                  Show this help\n\nProtected outbound.send, production.deploy, and merge actions remain denied locally.\n`);
   process.exit(exitCode);
 }
 
@@ -43,11 +43,12 @@ function parseArgs(argv) {
   const values = new Set([
     "--runtime", "--agent-id", "--machine-id", "--capabilities", "--capacity",
     "--api-base", "--config", "--receipt-log", "--openclaw-agent-id",
+    "--runtime-agent-id", "--runtime-executable", "--workspace",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") usage(0);
-    if (["--foreground", "--no-service", "--dry-run", "--self-test"].includes(arg)) {
+    if (["--foreground", "--no-service", "--dry-run", "--self-test", "--receipt-only", "--replace-agent", "--test-mode"].includes(arg)) {
       options[arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -100,6 +101,64 @@ function commandPath(name) {
   return result.status === 0 ? result.stdout.trim().split(/\r?\n/)[0] : null;
 }
 
+function runtimeExecutable(runtime, override) {
+  if (override) return expandPath(override);
+  const candidates = {
+    // Prefer the self-contained desktop binary on macOS. Homebrew's `codex`
+    // launcher commonly relies on `#!/usr/bin/env node`, which is not
+    // available under launchd's intentionally minimal PATH.
+    codex: ["/Applications/ChatGPT.app/Contents/Resources/codex", "codex"],
+    "claude-code": ["claude"],
+    openclaw: ["openclaw"],
+    valoride: ["valor", "valoride"],
+    valklaw: ["valor", "valklaw"],
+  }[runtime] ?? [];
+  for (const candidate of candidates) {
+    if (candidate.startsWith("/") && fs.existsSync(candidate)) return candidate;
+    const resolved = commandPath(candidate);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function executionConfig(runtime, options, agentId, machineId) {
+  if (options.receiptOnly || runtime === "agent") return null;
+  const executable = runtimeExecutable(runtime, options.runtimeExecutable);
+  if (!executable) {
+    throw new Error(`No executable runtime found for ${runtime}; install its product CLI or use --receipt-only explicitly`);
+  }
+  const workingDirectory = expandPath(options.workspace ?? process.env.VALKYR_SWARM_WORKSPACE ?? process.cwd());
+  const runtimeAgentId = safeId(
+    options.runtimeAgentId ?? options.openclawAgentId ?? process.env.OPENCLAW_AGENT_ID ?? agentId,
+    "runtimeAgentId",
+  );
+  if (runtime === "openclaw") {
+    return {
+      adapter: "openclaw-agent",
+      agentId: runtimeAgentId,
+      executable,
+      requireGateway: true,
+      sessionKeyPrefix: `valkyr-swarm-${machineId}`,
+      timeoutSeconds: 600,
+      workingDirectory,
+    };
+  }
+  const adapter = {
+    codex: "codex-cli",
+    "claude-code": "claude-code-cli",
+    valoride: "valoride-cli",
+    valklaw: "valoride-cli",
+  }[runtime];
+  if (!adapter) throw new Error(`Runtime ${runtime} does not have a productized execution adapter`);
+  return { adapter, agentId: runtimeAgentId, executable, timeoutSeconds: 600, workingDirectory };
+}
+
+function requireProductionApiBase(apiBase, testMode = false) {
+  if (apiBase !== DEFAULT_API_BASE && !testMode) {
+    throw new Error(`Durable SWARM activation must use ${DEFAULT_API_BASE}; use --test-mode only for isolated tests`);
+  }
+}
+
 function defaultReceiptLog(machineId) {
   if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Logs", `valkyr-swarm-${machineId}.jsonl`);
   return path.join(os.homedir(), ".local", "state", "valkyr-swarm", `${machineId}.jsonl`);
@@ -112,6 +171,7 @@ function buildConfig(options) {
   const capacity = Number(options.capacity ?? 1);
   if (!Number.isInteger(capacity) || capacity < 1 || capacity > 100) throw new Error("capacity must be an integer from 1 to 100");
   const apiBase = normalizeApiBase(options.apiBase ?? process.env.VALKYR_API_BASE ?? DEFAULT_API_BASE);
+  requireProductionApiBase(apiBase, options.testMode);
   const keychainService = process.env.VALKYR_KEYCHAIN_SERVICE ?? DEFAULT_KEYCHAIN_SERVICE;
   const tokenFile = expandPath(process.env.VALKYR_SWARM_TOKEN_FILE ?? DEFAULT_TOKEN_FILE);
   const credentialFile = expandPath(process.env.VALKYR_SWARM_CREDENTIAL_FILE ?? DEFAULT_CREDENTIAL_FILE);
@@ -123,18 +183,8 @@ function buildConfig(options) {
     capacity,
     capabilities: parseCapabilities(options.capabilities, runtime),
   };
-  if (runtime === "openclaw" && options.openclawAgentId) {
-    const executable = commandPath("openclaw");
-    if (!executable) throw new Error("--openclaw-agent-id requires the OpenClaw CLI on PATH");
-    agent.execution = {
-      adapter: "openclaw-agent",
-      agentId: safeId(options.openclawAgentId, "openclawAgentId"),
-      executable,
-      requireGateway: true,
-      sessionKeyPrefix: `valkyr-swarm-${machineId}`,
-      timeoutSeconds: 600,
-    };
-  }
+  const execution = executionConfig(runtime, options, agentId, machineId);
+  if (execution) agent.execution = execution;
   return {
     apiBase,
     configPath,
@@ -151,13 +201,28 @@ function buildConfig(options) {
       heartbeatSeconds: 30,
       agents: [agent],
     },
+    mergeAgents: !options.replaceAgent,
   };
 }
 
 function writeConfig(target) {
   fs.mkdirSync(path.dirname(target.configPath), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.dirname(target.receiptLog), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(target.configPath, `${JSON.stringify(target.config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  let config = target.config;
+  if (target.mergeAgents && fs.existsSync(target.configPath)) {
+    const existing = JSON.parse(fs.readFileSync(target.configPath, "utf8"));
+    if (existing.machineId !== config.machineId) throw new Error("Existing SWARM config belongs to another machine");
+    requireProductionApiBase(normalizeApiBase(existing.serverUrl));
+    const agents = new Map((existing.agents ?? []).map((agent) => [agent.agentId, agent]));
+    config.agents.forEach((agent) => agents.set(agent.agentId, agent));
+    config = {
+      ...existing,
+      ...config,
+      agents: [...agents.values()].sort((a, b) => a.agentId.localeCompare(b.agentId)),
+    };
+  }
+  target.config = config;
+  fs.writeFileSync(target.configPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.chmodSync(target.configPath, 0o600);
 }
 
@@ -216,6 +281,13 @@ function selfTest() {
   if (target.config.machineId !== "example-host") throw new Error("Machine normalization failed");
   if (target.config.agents[0].agentId !== "codex-example-host") throw new Error("Agent derivation failed");
   if (target.apiBase !== DEFAULT_API_BASE) throw new Error("Default API base failed");
+  if (target.config.agents[0].execution?.adapter !== "codex-cli") throw new Error("Codex activation must enable productized execution");
+  try {
+    buildConfig({ runtime: "codex", machineId: "test", apiBase: "https://loki.valkyrlabs.com/v1" });
+    throw new Error("Non-production activation was accepted");
+  } catch (error) {
+    if (String(error?.message ?? error) === "Non-production activation was accepted") throw error;
+  }
   try {
     parseCapabilities("workflow.debug,header\ninjection", "codex");
     throw new Error("Unsafe capability was accepted");
@@ -237,6 +309,7 @@ async function main() {
     receiptLog: target.receiptLog,
     machineId: target.config.machineId,
     agent: target.config.agents[0],
+    executionAdapter: target.config.agents[0].execution?.adapter ?? "receipt-only",
     mode: options.noService ? "configure-only" : options.foreground ? "foreground" : "supervised",
   };
   if (options.dryRun) {
@@ -265,4 +338,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   });
 }
 
-export { buildConfig, detectRuntime, parseArgs, parseCapabilities, safeId };
+export {
+  buildConfig,
+  detectRuntime,
+  executionConfig,
+  parseArgs,
+  parseCapabilities,
+  requireProductionApiBase,
+  runtimeExecutable,
+  safeId,
+  writeConfig,
+};

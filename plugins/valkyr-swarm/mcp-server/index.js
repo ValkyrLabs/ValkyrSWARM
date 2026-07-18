@@ -14,9 +14,15 @@ import {
   normalizeApiBase,
   persistAuthentication,
 } from "../scripts/swarm-auth.mjs";
+import {
+  DEFAULT_HANDOFF_SOURCE,
+  DEFAULT_RECEIPT_SOURCE,
+  queryMemory,
+  writeMemory,
+} from "../scripts/swarm-graymatter.mjs";
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
-const SERVER_INFO = { name: "valkyr-swarm", version: "0.2.0" };
+const SERVER_INFO = { name: "valkyr-swarm", version: "0.3.0" };
 
 const TOOLS = [
   {
@@ -66,6 +72,45 @@ const TOOLS = [
         contextPageRef: { type: "string", maxLength: 2048 },
       },
       required: ["targetAgentId", "action", "instruction"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "swarm_handoff_write",
+    description: "Persist a bounded tenant-scoped shared agent handoff in GrayMatter using the authenticated session.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", minLength: 1, maxLength: 16000 },
+        tags: { type: "array", items: { type: "string", maxLength: 80 }, maxItems: 20 },
+      },
+      required: ["text"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "swarm_invariants_query",
+    description: "Query binding shared decisions and invariants from GrayMatter before planning or execution.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 1000 },
+        limit: { type: "integer", minimum: 1, maximum: 50 },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "swarm_receipts_query",
+    description: "Query GrayMatter command receipts persisted by tenant SWARM runtime nodes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 1000 },
+        limit: { type: "integer", minimum: 1, maximum: 50 },
+      },
+      required: ["query"],
       additionalProperties: false,
     },
   },
@@ -201,6 +246,43 @@ class ValkyrSwarmClient {
     return this.request(`/swarm-ops/commands/${encodeURIComponent(safeIdentifier(commandId, "commandId"))}/status`);
   }
 
+  async handoffWrite(args) {
+    const text = boundedString(args.text, "text", { max: 16_000 });
+    const tags = Array.isArray(args.tags) ? args.tags.slice(0, 20) : [];
+    return writeMemory({
+      apiBase: this.apiBase,
+      token: await this.token(),
+      type: "context",
+      text,
+      sourceChannel: DEFAULT_HANDOFF_SOURCE,
+      tags: ["swarm", "handoff", ...tags],
+      fetchImpl: this.fetchImpl,
+    });
+  }
+
+  async invariantsQuery(args) {
+    return queryMemory({
+      apiBase: this.apiBase,
+      token: await this.token(),
+      query: boundedString(args.query, "query", { max: 1_000 }),
+      type: "decision",
+      limit: args.limit,
+      fetchImpl: this.fetchImpl,
+    });
+  }
+
+  async receiptsQuery(args) {
+    return queryMemory({
+      apiBase: this.apiBase,
+      token: await this.token(),
+      query: boundedString(args.query, "query", { max: 1_000 }),
+      type: "artifact",
+      sourceChannel: DEFAULT_RECEIPT_SOURCE,
+      limit: args.limit,
+      fetchImpl: this.fetchImpl,
+    });
+  }
+
   async dispatch(args) {
     const targetAgentId = safeIdentifier(args.targetAgentId, "targetAgentId");
     const action = safeIdentifier(args.action, "action");
@@ -257,6 +339,9 @@ async function callTool(client, name, args = {}) {
   if (name === "swarm_graph") return client.graph();
   if (name === "swarm_command_status") return client.commandStatus(args.commandId);
   if (name === "swarm_dispatch") return client.dispatch(args);
+  if (name === "swarm_handoff_write") return client.handoffWrite(args);
+  if (name === "swarm_invariants_query") return client.invariantsQuery(args);
+  if (name === "swarm_receipts_query") return client.receiptsQuery(args);
   throw new Error(`Unknown tool: ${name}`);
 }
 
