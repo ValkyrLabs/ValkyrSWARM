@@ -283,6 +283,19 @@ class ValkyrSwarmClient {
     });
   }
 
+  async dispatchScope() {
+    const tenant = await this.request("/tenant-schemas/preflight/graymatter_status?operation=memory.write");
+    const tenantSchemaName = boundedString(tenant?.schemaName, "authenticated tenant schema name", { max: 160 });
+    const runtimeIsolationMode = boundedString(tenant?.isolationMode, "authenticated tenant isolation mode", { max: 160 });
+    const runtimeScope = safeIdentifier(new URL(this.apiBase).host, "authenticated runtime scope");
+    return {
+      applicationId: SERVER_INFO.name,
+      tenantSchemaName,
+      runtimeScope,
+      runtimeIsolationMode,
+    };
+  }
+
   async dispatch(args) {
     const targetAgentId = safeIdentifier(args.targetAgentId, "targetAgentId");
     const action = safeIdentifier(args.action, "action");
@@ -296,6 +309,7 @@ class ValkyrSwarmClient {
       : boundedString(args.contextPageRef, "contextPageRef", { max: 2_048 });
     const timestamp = new Date().toISOString();
     const sourceId = safeIdentifier(this.env.VALKYR_SWARM_MCP_INSTANCE_ID ?? "valkyr-swarm-mcp", "VALKYR_SWARM_MCP_INSTANCE_ID");
+    const scope = await this.dispatchScope();
     const data = {
       instruction,
       source: "valkyr-swarm-mcp",
@@ -303,12 +317,14 @@ class ValkyrSwarmClient {
       requiresApproval: false,
       approvalReceiptRef: null,
       contextPageRef,
+      scope,
     };
     const metadata = {
       source: "valkyr-swarm-mcp",
       controlSurface: "mcp",
       protectedAction: false,
       approvalReceiptRef: null,
+      scope,
     };
     return this.request("/swarm-ops/command", {
       method: "POST",

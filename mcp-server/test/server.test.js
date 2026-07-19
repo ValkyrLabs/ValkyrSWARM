@@ -47,12 +47,18 @@ test("protected dispatch fails closed without a human approval receipt", async (
 });
 
 test("safe dispatch targets one explicit agent and never accepts tenant identity", async () => {
-  let captured;
+  const requests = [];
   const client = new ValkyrSwarmClient({
     env: { VALKYR_AUTH_TOKEN: "test-token", VALKYR_API_BASE: "https://api-0.valkyrlabs.com/v1" },
     persistImpl: () => {},
     fetchImpl: async (url, options) => {
-      captured = { url, headers: options.headers, body: JSON.parse(options.body) };
+      if (url.includes("/tenant-schemas/preflight/graymatter_status")) {
+        return new Response(JSON.stringify({ schemaName: "tenant_alpha", isolationMode: "ORG_SCHEMA" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      requests.push({ url, headers: options.headers, body: JSON.parse(options.body) });
       return new Response(JSON.stringify({ status: "accepted", commandId: "cmd-1" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -64,6 +70,7 @@ test("safe dispatch targets one explicit agent and never accepts tenant identity
     action: "workflow.debug",
     instruction: "Inspect the failing workflow without making changes",
   });
+  const [captured] = requests;
   assert.equal(result.commandId, "cmd-1");
   assert.equal(captured.url, "https://api-0.valkyrlabs.com/v1/swarm-ops/command");
   assert.equal(captured.body.targetInstanceId, "codex-reviewer");
@@ -71,7 +78,36 @@ test("safe dispatch targets one explicit agent and never accepts tenant identity
   assert.equal(captured.body.message.payload.action, "workflow.debug");
   assert.equal(JSON.stringify(captured.body).includes("tenantId"), false);
   assert.equal(captured.body.message.payload.metadata.includes('"protectedAction":false'), true);
+  assert.deepEqual(JSON.parse(captured.body.message.payload.metadata).scope, {
+    applicationId: "valkyr-swarm",
+    tenantSchemaName: "tenant_alpha",
+    runtimeScope: "api-0.valkyrlabs.com",
+    runtimeIsolationMode: "ORG_SCHEMA",
+  });
+  assert.deepEqual(JSON.parse(captured.body.message.payload.data).scope, JSON.parse(captured.body.message.payload.metadata).scope);
   assert.match(captured.headers.Authorization, /^Bearer /);
+});
+
+test("dispatch fails closed when authenticated tenant scope cannot be resolved", async () => {
+  let commandRequested = false;
+  const client = new ValkyrSwarmClient({
+    env: { VALKYR_AUTH_TOKEN: "test-token" },
+    fetchImpl: async (url) => {
+      if (url.includes("/tenant-schemas/preflight/graymatter_status")) {
+        return new Response(JSON.stringify({ schemaName: null, isolationMode: "ORG_SCHEMA" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      commandRequested = true;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  await assert.rejects(
+    client.dispatch({ targetAgentId: "reviewer", action: "workflow.debug", instruction: "Inspect it" }),
+    /authenticated tenant schema name must be a string/,
+  );
+  assert.equal(commandRequested, false);
 });
 
 test("agent detail and graph remain tenant-derived read surfaces", async () => {

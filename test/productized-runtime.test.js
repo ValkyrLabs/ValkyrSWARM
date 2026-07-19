@@ -15,6 +15,7 @@ import {
   buildRuntimeInvocation,
   executeRuntimeCommand,
   runtimeExecutionConfig,
+  supervisedRuntimeEnvironment,
   validateRuntimeAdapter,
 } from "../scripts/swarm-runtime-adapters.mjs";
 
@@ -122,3 +123,8 @@ test("Codex execution streams progress and returns a terminal artifact", async (
   assert.equal(progress[0].stream, "stdout");
 });
 
+test("supervised runtime execution always makes the active Node binary discoverable", () => {
+  const env = supervisedRuntimeEnvironment({ PATH: "/usr/bin:/bin" });
+  assert.equal(env.PATH.split(path.delimiter)[0], path.dirname(process.execPath));
+  assert.equal(env.PATH.split(path.delimiter).includes("/usr/bin"), true);
+});

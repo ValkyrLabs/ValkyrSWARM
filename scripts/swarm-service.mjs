@@ -122,6 +122,16 @@ function serviceSpec(options, loaded, platform = process.platform) {
   const servicePath = platform === "darwin"
     ? path.join(os.homedir(), "Library", "LaunchAgents", `${label}.plist`)
     : path.join(os.homedir(), ".config", "systemd", "user", `${label}.service`);
+  const runtimePath = [...new Set([
+    path.dirname(process.execPath),
+    path.join(os.homedir(), ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ])].join(":");
   return {
     configPath: loaded.configPath,
     credentialFile,
@@ -130,6 +140,7 @@ function serviceSpec(options, loaded, platform = process.platform) {
     machineId,
     platform,
     receiptLog,
+    runtimePath,
     serverUrl,
     servicePath,
     stderrLog,
@@ -165,6 +176,7 @@ function plist(spec) {
 ${argumentsXml}
     </array>
     <key>WorkingDirectory</key><string>${xml(REPO_ROOT)}</string>
+    <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(spec.runtimePath)}</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ThrottleInterval</key><integer>15</integer>
@@ -185,6 +197,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${systemdArg(REPO_ROOT)}
+Environment=${systemdArg(`PATH=${spec.runtimePath}`)}
 ExecStart=${agentArguments(spec).map(systemdArg).join(" ")}
 SyslogIdentifier=${spec.label}
 Restart=on-failure
@@ -281,7 +294,7 @@ function selfTest() {
   for (const platform of ["darwin", "linux"]) {
     const spec = serviceSpec({}, loaded, platform);
     const content = serviceDefinition(spec);
-    for (const required of [spec.label, process.execPath, AGENT_SCRIPT, "--continuous", "--token-file", "--credential-file", "VALKYR_AUTH"]) {
+    for (const required of [spec.label, process.execPath, path.dirname(process.execPath), AGENT_SCRIPT, "--continuous", "--token-file", "--credential-file", "VALKYR_AUTH", "PATH"]) {
       if (!content.includes(required)) throw new Error(`${platform} service is missing ${required}`);
     }
     if (/Bearer |eyJ[A-Za-z0-9_-]+\.|API0_JWT_SESSION|VALKYR_AUTH_TOKEN|VALKYR_PASSWORD/.test(content)) {

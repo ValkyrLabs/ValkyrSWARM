@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
+import process from "node:process";
 
 const DEFAULT_TIMEOUT_SECONDS = 600;
 const MAX_PROMPT_CHARS = 24_000;
@@ -8,6 +10,17 @@ const MAX_STREAM_BYTES = 1024 * 1024;
 function boundedText(value, limit) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? {});
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[TRUNCATED]`;
+}
+
+function supervisedRuntimeEnvironment(env = process.env) {
+  const nodeDirectory = path.dirname(process.execPath);
+  const pathEntries = String(env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean);
+  return {
+    ...env,
+    PATH: [...new Set([nodeDirectory, ...pathEntries])].join(path.delimiter),
+  };
 }
 
 function safeSessionSegment(value) {
@@ -221,7 +234,7 @@ async function executeRuntimeCommand({ agent, wire, spawnImpl = spawn, onProgres
     args,
     {
       cwd: config.workingDirectory,
-      env: process.env,
+      env: supervisedRuntimeEnvironment(),
       timeoutMs: (config.timeoutSeconds + 30) * 1000,
     },
     { spawnImpl, onProgress },
@@ -246,5 +259,6 @@ export {
   openClawExecutionConfig,
   runtimeExecutionConfig,
   summarizeOpenClawResult,
+  supervisedRuntimeEnvironment,
   validateRuntimeAdapter,
 };
