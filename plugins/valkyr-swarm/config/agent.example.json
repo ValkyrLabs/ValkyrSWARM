@@ -17,6 +17,39 @@
         "executable": "codex",
         "workingDirectory": "~/workspace",
         "timeoutSeconds": 600
+      },
+      "workflowRuntime": {
+        "enabled": true,
+        "endpoint": "http://127.0.0.1:8765/v1/swarm/workflow-runs/execute",
+        "healthEndpoint": "http://127.0.0.1:8765/v1/swarm/workflow-runs/health",
+        "timeoutSeconds": 900,
+        "capabilities": ["java:17", "graymatter.context"],
+        "supportedModels": [],
+        "supportedTools": ["workflow.runner.execute-module"],
+        "allowedEnvironments": ["sandbox", "staging"],
+        "allowedDataClassifications": ["internal"],
+        "privacyZones": ["internal"],
+        "networkZones": ["loopback"],
+        "maxConcurrency": 1,
+        "estimatedCost": 0,
+        "estimatedLatencyMs": 100,
+        "trustScore": 0.9,
+        "localExecution": true,
+        "leaseDurationSeconds": 120,
+        "install": {
+          "version": "1.0.3",
+          "runnerProtocol": "valkyr-workflow-runner/v1",
+          "artifactUrl": "https://downloads.valkyrlabs.com/workflow-runtime/valkyrai-workflow-runtime.jar",
+          "sha256": "REPLACE_WITH_RELEASE_SHA256",
+          "minimumJavaVersion": 17,
+          "artifactPath": "~/.local/share/valkyr-swarm/workflow-runtimes/codex-example-host.jar",
+          "runtimePropertiesPath": "~/.config/valkyr-swarm/workflow-runtimes/codex-example-host.properties",
+          "runtimeDataPath": "~/.local/share/valkyr-swarm/workflow-runtimes/codex-example-host-data",
+          "runtimeWorkingDirectory": "~/.local/share/valkyr-swarm/workflow-runtimes/codex-example-host-work",
+          "javaExecutable": "java",
+          "jvmArgs": ["-Xms128m", "-Xmx512m"],
+          "arguments": []
+        }
       }
     }
   ]

@@ -5,7 +5,12 @@ import path from "node:path";
 const DEFAULT_RECEIPT_SOURCE = "valkyr-swarm:receipts";
 const DEFAULT_HANDOFF_SOURCE = "valkyr-swarm:handoff";
 const MAX_MEMORY_TEXT_CHARS = 16_000;
+const GRAYMATTER_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_REPLAY_DIR = path.join(os.homedir(), ".config", "valkyr-swarm", "graymatter-replay");
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const SENSITIVE_KEY = /(authorization|bearer|cookie|credential|password|private.?key|secret|token|api.?key)/i;
+const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
+const CANONICAL_APPROVAL_REF = /^gm_approval_[0-9a-f]{64}$/;
 
 function boundedText(value, max = MAX_MEMORY_TEXT_CHARS) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? {});
@@ -21,6 +26,37 @@ function safeTag(value) {
     .slice(0, 80);
 }
 
+function redactText(value, max = 1_000) {
+  return String(value ?? "")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(JWT, "[REDACTED_JWT]")
+    .replace(
+      /(password|secret|token|authorization|api.?key|credential|cookie|private.?key)(\s*[=:]\s*)([^\s,;]+)/gi,
+      "$1$2[REDACTED]",
+    )
+    .slice(0, max);
+}
+
+function redactStructured(value, key = "", depth = 0) {
+  if (SENSITIVE_KEY.test(key)) return "[REDACTED]";
+  if (depth >= 5) return "[TRUNCATED_DEPTH]";
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") {
+    return value ?? null;
+  }
+  if (typeof value === "string") return redactText(value);
+  if (Array.isArray(value)) {
+    return value.slice(0, 25).map((item) => redactStructured(item, key, depth + 1));
+  }
+  if (typeof value === "object") {
+    const result = {};
+    for (const [childKey, child] of Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).slice(0, 25)) {
+      result[childKey] = redactStructured(child, childKey, depth + 1);
+    }
+    return result;
+  }
+  return redactText(value);
+}
+
 function normalizeApiBase(value) {
   return String(value ?? "https://api-0.valkyrlabs.com/v1").replace(/\/+$/, "");
 }
@@ -34,7 +70,10 @@ async function requestGrayMatter({ apiBase, token, pathname, body, fetchImpl = f
       Accept: "application/json",
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10_000),
+    // Production writes can include authorized relationship normalization and
+    // semantic indexing. Keep the request bounded while allowing the server to
+    // return its durable receipt before the local replay item is removed.
+    signal: AbortSignal.timeout(GRAYMATTER_REQUEST_TIMEOUT_MS),
   });
   const text = await response.text();
   let parsed = {};
@@ -101,6 +140,8 @@ async function queryMemory({
 }
 
 function commandReceiptText({ agent, wire, response }) {
+  const protectedAction = PROTECTED_ACTIONS.has(String(wire.action ?? "").toLowerCase());
+  const approvalRef = String(wire.command?.approvalRef ?? "").trim();
   return JSON.stringify({
     schemaVersion: "valkyr-swarm-command-receipt/0.1",
     commandId: wire.commandId,
@@ -112,7 +153,8 @@ function commandReceiptText({ agent, wire, response }) {
     type: response.type,
     reason: response.reason ?? null,
     result: compactCommandResult(response.result),
-    protectedAction: false,
+    protectedAction,
+    approvalRef: protectedAction && CANONICAL_APPROVAL_REF.test(approvalRef) ? approvalRef : null,
     recordedAt: new Date().toISOString(),
   });
 }
@@ -127,6 +169,12 @@ function compactCommandResult(result) {
     "runtimeAgentId",
     "sessionKey",
     "status",
+    "workflowRunId",
+    "workflowExecutionId",
+    "workflowRunnerId",
+    "leaseFence",
+    "terminalState",
+    "checkpointRef",
     "grayMatterReceiptRef",
     "grayMatterReceiptStatus",
   ]) {
@@ -150,6 +198,12 @@ function compactCommandResult(result) {
       artifact.outputSummary = boundedText(result.artifact.output, 2_000);
     }
     if (result.artifact.stderr) artifact.stderrSummary = boundedText(result.artifact.stderr, 500);
+    const structured = Object.fromEntries(
+      Object.entries(result.artifact).filter(([key]) => !["output", "stderr"].includes(key)),
+    );
+    if (Object.keys(structured).length > 0) {
+      artifact.structuredSummary = boundedText(JSON.stringify(redactStructured(structured)), 8_000);
+    }
     compact.artifact = artifact;
   }
   return compact;
@@ -174,6 +228,72 @@ async function persistCommandReceipt({
     sourceChannel: DEFAULT_RECEIPT_SOURCE,
     sourceMessageId,
     tags: ["swarm", "receipt", agent.runtime, response.status, wire.action].map(safeTag).filter(Boolean),
+  };
+  try {
+    return await requestGrayMatter({
+      apiBase,
+      token,
+      pathname: "/MemoryEntry/write",
+      body,
+      fetchImpl,
+    });
+  } catch (error) {
+    const queuePath = queueReceiptReplay({
+      agentId: agent.agentId,
+      apiBase,
+      body,
+      replayDir,
+    });
+    return {
+      id: null,
+      queued: true,
+      queuePath,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function persistWorkflowHandoff({
+  agent,
+  apiBase,
+  tokenProvider,
+  wire,
+  response,
+  fetchImpl = fetch,
+  replayDir = DEFAULT_REPLAY_DIR,
+}) {
+  const token = await tokenProvider();
+  if (!token) throw new Error("GrayMatter workflow handoff requires authenticated SWARM session");
+  const result = response?.result && typeof response.result === "object" ? response.result : {};
+  const workflowExecutionId = String(result.workflowExecutionId ?? "").trim();
+  if (!workflowExecutionId) throw new Error("GrayMatter workflow handoff requires workflowExecutionId");
+  const sequence = Number.isSafeInteger(Number(result.sequence)) ? Number(result.sequence) : 0;
+  const executionState = String(result.executionState ?? response.status ?? "unknown").trim().toUpperCase();
+  const text = JSON.stringify({
+    schemaVersion: "valkyr-swarm-workflow-handoff/0.1",
+    commandId: wire.commandId,
+    traceId: wire.trace?.traceId ?? null,
+    workflowExecutionId,
+    workflowRunnerId: result.workflowRunnerId ?? null,
+    leaseFence: result.leaseFence ?? null,
+    eventType: result.eventType ?? null,
+    executionState,
+    checkpointRef: result.checkpointRef ?? null,
+    status: response.status,
+    agentId: agent.agentId,
+    runtime: agent.runtime,
+    result: compactCommandResult(result),
+    synchronizedAt: new Date().toISOString(),
+  });
+  const body = {
+    type: "context",
+    text: boundedText(text),
+    source: DEFAULT_HANDOFF_SOURCE,
+    sourceChannel: DEFAULT_HANDOFF_SOURCE,
+    sourceMessageId: boundedText(
+      `swarm-workflow:${workflowExecutionId}:${sequence}:${executionState.toLowerCase()}`, 160),
+    tags: ["swarm", "workflow", "handoff", agent.runtime, response.status, executionState]
+      .map(safeTag).filter(Boolean),
   };
   try {
     return await requestGrayMatter({
@@ -266,9 +386,11 @@ export {
   compactCommandResult,
   commandReceiptText,
   persistCommandReceipt,
+  persistWorkflowHandoff,
   queryMemory,
   queueReceiptReplay,
   replayQueuedReceipts,
+  redactStructured,
   requestGrayMatter,
   writeMemory,
 };

@@ -13,9 +13,10 @@ import {
   normalizeApiBase,
 } from "./swarm-auth.mjs";
 import { validateConfig } from "./swarm-agent.mjs";
+import { probeWorkflowRuntime } from "./swarm-workflow-runtime.mjs";
 import { ValkyrSwarmClient } from "../mcp-server/index.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const FORBIDDEN_CONFIG_KEYS = new Set([
   "authorization", "bearertoken", "jwt", "ownerid", "organizationid",
   "password", "secret", "tenantid", "token", "username",
@@ -89,7 +90,14 @@ function forbiddenConfigPaths(value, prefix = []) {
 }
 
 function readReceiptEvidence(receiptPath, agentIds, now = Date.now()) {
-  if (!fs.existsSync(receiptPath)) return { exists: false, heartbeatAgeSeconds: null, latestEvent: null, secretSafe: true };
+  if (!fs.existsSync(receiptPath)) return {
+    exists: false,
+    heartbeatAgeSeconds: null,
+    serverAckAgeSeconds: null,
+    serverAckAgents: [],
+    latestEvent: null,
+    secretSafe: true,
+  };
   const stat = fs.statSync(receiptPath);
   const start = Math.max(0, stat.size - 128 * 1024);
   const buffer = Buffer.alloc(stat.size - start);
@@ -108,13 +116,28 @@ function readReceiptEvidence(receiptPath, agentIds, now = Date.now()) {
     }
   });
   const heartbeats = rows.filter((row) => row.event === "heartbeat_sent" && agentIds.includes(row.agentId));
+  const serverAcks = rows.filter((row) => row.event === "heartbeat_ack" && agentIds.includes(row.agentId));
   const latestHeartbeat = heartbeats.at(-1);
+  const serverAckAgents = agentIds.map((agentId) => {
+    const latest = serverAcks.filter((row) => row.agentId === agentId).at(-1);
+    return {
+      agentId,
+      ageSeconds: latest?.timestamp
+        ? Math.max(0, Math.round((now - Date.parse(latest.timestamp)) / 1000))
+        : null,
+    };
+  });
+  const allServerAckAges = serverAckAgents.map((value) => value.ageSeconds);
   const latestEvent = rows.at(-1) ?? null;
   return {
     exists: true,
     heartbeatAgeSeconds: latestHeartbeat?.timestamp
       ? Math.max(0, Math.round((now - Date.parse(latestHeartbeat.timestamp)) / 1000))
       : null,
+    serverAckAgeSeconds: allServerAckAges.length > 0 && allServerAckAges.every((value) => value !== null)
+      ? Math.max(...allServerAckAges)
+      : null,
+    serverAckAgents,
     latestEvent: latestEvent ? { event: latestEvent.event, timestamp: latestEvent.timestamp } : null,
     secretSafe: !JWT.test(text) && !/\bBearer\s+[A-Za-z0-9._~-]{8,}/i.test(text),
   };
@@ -137,6 +160,26 @@ function serviceState(machineId) {
   if (process.platform === "linux") {
     const unit = `${label}.service`;
     const result = spawnSync("systemctl", ["--user", "is-active", unit], { encoding: "utf8" });
+    return { label, installed: result.status === 0, running: result.stdout.trim() === "active", pid: null, supervisor: "systemd-user" };
+  }
+  return { label, installed: false, running: false, pid: null, supervisor: "foreground" };
+}
+
+function workflowRuntimeServiceState(agentId) {
+  const label = `com.valkyrlabs.workflow-runtime.${agentId}`;
+  if (process.platform === "darwin") {
+    const result = spawnSync("/bin/launchctl", ["print", `gui/${process.getuid()}/${label}`], { encoding: "utf8" });
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    return {
+      label,
+      installed: result.status === 0,
+      running: result.status === 0 && /\bstate = running\b/.test(output),
+      pid: Number(output.match(/\bpid = (\d+)/)?.[1] ?? 0) || null,
+      supervisor: "launchd",
+    };
+  }
+  if (process.platform === "linux") {
+    const result = spawnSync("systemctl", ["--user", "is-active", `${label}.service`], { encoding: "utf8" });
     return { label, installed: result.status === 0, running: result.stdout.trim() === "active", pid: null, supervisor: "systemd-user" };
   }
   return { label, installed: false, running: false, pid: null, supervisor: "foreground" };
@@ -204,9 +247,23 @@ async function diagnose(options = {}) {
   if (receipt.exists && receipt.heartbeatAgeSeconds !== null) {
     checks.push(check("heartbeat", receipt.heartbeatAgeSeconds <= 120 ? "pass" : "warn", { ageSeconds: receipt.heartbeatAgeSeconds }));
   }
+  checks.push(check(
+    "server_heartbeat_ack",
+    receipt.serverAckAgeSeconds !== null && receipt.serverAckAgeSeconds <= 120 ? "pass" : "fail",
+    { ageSeconds: receipt.serverAckAgeSeconds, agents: receipt.serverAckAgents, required: true },
+  ));
 
   const service = serviceState(paths.machineId);
   checks.push(check("supervision", service.running ? "pass" : service.installed ? "warn" : "fail", service));
+  for (const agent of agents.filter((value) => value.workflowRuntime?.enabled)) {
+    const nativeService = workflowRuntimeServiceState(agent.agentId);
+    const runtime = await probeWorkflowRuntime(agent);
+    checks.push(check(
+      `workflow_runtime:${agent.agentId}`,
+      nativeService.running && runtime.healthy ? "pass" : nativeService.installed || runtime.healthy ? "warn" : "fail",
+      { ...nativeService, health: runtime.status, healthy: runtime.healthy, version: runtime.version ?? null },
+    ));
+  }
 
   let live = null;
   if (options.live && config) {
@@ -270,4 +327,4 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   });
 }
 
-export { defaultPaths, defaultReceiptLog, diagnose, forbiddenConfigPaths, parseArgs, readReceiptEvidence, safeId, serviceState };
+export { defaultPaths, defaultReceiptLog, diagnose, forbiddenConfigPaths, parseArgs, readReceiptEvidence, safeId, serviceState, workflowRuntimeServiceState };

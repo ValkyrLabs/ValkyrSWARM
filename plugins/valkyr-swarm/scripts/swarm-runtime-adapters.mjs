@@ -12,6 +12,15 @@ function boundedText(value, limit) {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[TRUNCATED]`;
 }
 
+function boundedTerminalText(value, limit) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? {});
+  if (text.length <= limit) return text;
+  const marker = "\n[TRUNCATED MIDDLE; TERMINAL TAIL RETAINED]\n";
+  const available = Math.max(0, limit - marker.length);
+  const headLength = Math.floor(available / 4);
+  return `${text.slice(0, headLength)}${marker}${text.slice(-(available - headLength))}`;
+}
+
 function supervisedRuntimeEnvironment(env = process.env) {
   const nodeDirectory = path.dirname(process.execPath);
   const pathEntries = String(env.PATH ?? "")
@@ -80,6 +89,13 @@ function buildRuntimePrompt(wire, agent) {
   const command = wire?.command ?? {};
   const commandData = command?.payload?.data ?? command?.data ?? command?.payload ?? command;
   const scope = command?.scope ?? command?.payload?.metadata?.scope ?? command?.metadata?.scope;
+  const approvalRef = String(command?.approvalRef ?? "").trim();
+  const approvedProtectedAction = ["outbound.send", "production.deploy", "merge"].includes(wire?.action)
+    && /^gm_approval_[0-9a-f]{64}$/.test(approvalRef)
+    && command?.requiresApproval === true;
+  const protectedActionInstruction = approvedProtectedAction
+    ? `Canonical human approval ${approvalRef} authorizes only the exact protected action ${wire.action}. Do not perform any other outbound send, production deployment, merge, destructive, financial, legal, or personnel action.`
+    : "Protected actions remain prohibited inside this task: do not send outbound messages, deploy to production, or merge changes. Stop and request a separately correlated human approval receipt if any protected action becomes necessary.";
   return [
     `Execute this governed tenant-scoped Valkyr SWARM task using the canonical ${agent.runtime} runtime.`,
     "",
@@ -89,7 +105,8 @@ function buildRuntimePrompt(wire, agent) {
     `Trace id: ${wire.trace?.traceId ?? "unavailable"}`,
     scope ? `Authorized scope: ${boundedText(scope, 2_000)}` : null,
     "",
-    "Protected actions remain prohibited inside this task: do not send outbound messages, deploy to production, or merge changes. Stop and request a separately correlated human approval receipt if any protected action becomes necessary.",
+    protectedActionInstruction,
+    "Obey only the bounded Task payload. Do not expand a direct or read-only task into unrelated infrastructure diagnosis, plugin inspection, agent coordination, remediation, or project changes.",
     "Preserve unrelated work. Use GrayMatter for durable shared context and return concrete verification evidence and changed artifacts.",
     "",
     "Task payload:",
@@ -131,7 +148,11 @@ function buildRuntimeInvocation(config, wire, prompt) {
   }
   if (config.adapter === "valoride-cli") {
     return {
-      args: ["task", prompt, "--act", "--session", `swarm-${safeSessionSegment(wire.commandId)}`],
+      // `valor task --session <id>` attaches to an existing CLI session; it does
+      // not create one. Every governed SWARM command is an independent task, so
+      // let Valor create its own session and keep our command-derived key only
+      // as receipt correlation metadata.
+      args: ["task", prompt, "--act"],
       sessionKey: `valor-${safeSessionSegment(wire.commandId)}`,
     };
   }
@@ -201,6 +222,24 @@ function summarizeOpenClawResult(result) {
   };
 }
 
+function terminalAgentText(stdout) {
+  let terminal = "";
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event?.item?.type === "agent_message" && typeof event.item.text === "string") {
+        terminal = event.item.text;
+      } else if (event?.type === "result" && typeof event.result === "string") {
+        terminal = event.result;
+      }
+    } catch {
+      // CLI preambles and ordinary text output are retained in the bounded transcript.
+    }
+  }
+  return terminal ? boundedTerminalText(terminal, MAX_RESULT_TEXT_CHARS) : null;
+}
+
 function summarizeCliResult(config, stdout, stderr) {
   if (config.adapter === "openclaw-agent") {
     let parsed;
@@ -215,10 +254,12 @@ function summarizeCliResult(config, stdout, stderr) {
     return summarizeOpenClawResult(parsed);
   }
   const lines = stdout.split(/\r?\n/).filter(Boolean);
+  const terminalText = terminalAgentText(stdout);
   return {
-    output: boundedText(stdout, MAX_RESULT_TEXT_CHARS),
+    output: boundedTerminalText(stdout, MAX_RESULT_TEXT_CHARS),
     stderr: boundedText(stderr, 2_000),
     eventCount: lines.length,
+    ...(terminalText ? { terminalText } : {}),
   };
 }
 
@@ -260,5 +301,6 @@ export {
   runtimeExecutionConfig,
   summarizeOpenClawResult,
   supervisedRuntimeEnvironment,
+  terminalAgentText,
   validateRuntimeAdapter,
 };

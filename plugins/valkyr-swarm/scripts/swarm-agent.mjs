@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -15,18 +14,32 @@ import {
 import {
   credentialsFromSecureStorage,
   expandPath,
+  keychainRead,
   loginWithCredentials,
   persistAuthentication,
   readTokenFile,
 } from "./swarm-auth.mjs";
-import { persistCommandReceipt, replayQueuedReceipts } from "./swarm-graymatter.mjs";
+import {
+  persistCommandReceipt,
+  persistWorkflowHandoff,
+  replayQueuedReceipts,
+} from "./swarm-graymatter.mjs";
+import {
+  executeWorkflowRuntimeCommand,
+  forwardWorkflowEngineEventsOnce,
+  probeWorkflowRuntime,
+  supportsWorkflowRuntimeAction,
+  validateWorkflowRuntime,
+  workflowRunnerMetadata,
+} from "./swarm-workflow-runtime.mjs";
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
 const DEFAULT_DURATION_SECONDS = 72 * 60 * 60;
-const PACKAGE_VERSION = "0.3.0";
+const PACKAGE_VERSION = "0.4.0";
 const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
 const MAX_IDENTIFIER_LENGTH = 160;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
+const CANONICAL_APPROVAL_REF = /^gm_approval_[0-9a-f]{64}$/;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 
 function usage(exitCode = 0) {
@@ -52,7 +65,8 @@ Options:
 Agents execute through productized Codex, Claude Code, OpenClaw, or ValorIDE
 runtime adapters and stream progress plus terminal receipts over SWARM. Explicit
 receipt-only agents never execute. outbound.send, production.deploy, and merge
-are always NACKed.
+are accepted only with an exact content-bound human approval reference from the
+authenticated mothership and an explicitly advertised capability.
 `);
   process.exit(exitCode);
 }
@@ -82,20 +96,10 @@ function parseArgs(argv) {
 }
 
 function readKeychainToken(service) {
-  if (process.platform !== "darwin") return null;
-  if (!/^[A-Za-z0-9._:-]+$/.test(service)) {
-    throw new Error("Invalid keychain service name");
-  }
-  try {
-    const token = execFileSync(
-      "/usr/bin/security",
-      ["find-generic-password", "-s", service, "-w"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
-    return token || null;
-  } catch {
-    return null;
-  }
+  // Authentication is persisted under the deterministic `default` account.
+  // Selecting by service alone is ambiguous when an older username-scoped
+  // item exists and can reconnect the daemon as the wrong tenant principal.
+  return keychainRead(service, "default");
 }
 
 function createTokenProvider(
@@ -149,6 +153,38 @@ function commandDestinations(agentId) {
     destination: `/queue/agents/${agentId}/commands`,
     id: `private-${agentId}`,
   }];
+}
+
+function controlReplyDestination(agentId) {
+  return {
+    destination: "/user/queue/swarm-control",
+    id: `server-control-${safeIdentifier(agentId, "agentId")}`,
+  };
+}
+
+function parseServerControlReply(body) {
+  try {
+    const outer = JSON.parse(String(body ?? ""));
+    const envelope = typeof outer?.payload === "string"
+      ? JSON.parse(outer.payload)
+      : outer?.payload;
+    if (!envelope || !["ack", "nack"].includes(String(envelope.topic ?? "").toLowerCase())) return null;
+    const payload = envelope.payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    const ackId = String(payload.ackId ?? payload.commandId ?? "").trim();
+    if (!ackId || ackId.length > MAX_IDENTIFIER_LENGTH || !SAFE_IDENTIFIER.test(ackId)) return null;
+    return {
+      topic: String(envelope.topic).toLowerCase(),
+      ackId,
+      status: String(payload.status ?? "").toLowerCase(),
+      data: payload.data && typeof payload.data === "object" && !Array.isArray(payload.data)
+        ? payload.data : {},
+      code: payload.code ? redactedText(payload.code, 120) : null,
+      error: payload.error || payload.reason ? redactedText(payload.error ?? payload.reason, 240) : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function redactedError(error) {
@@ -240,6 +276,7 @@ function validateConfig(config) {
     }
     for (const capability of agent.capabilities) safeIdentifier(capability, `capability for ${agent.agentId}`);
     validateRuntimeAdapter(agent);
+    validateWorkflowRuntime(agent);
     const capacity = Number(agent.capacity ?? 1);
     if (!Number.isInteger(capacity) || capacity < 1 || capacity > 100) {
       throw new Error(`SWARM agent ${agent.agentId} capacity must be an integer from 1 to 100`);
@@ -247,17 +284,55 @@ function validateConfig(config) {
   }
 }
 
-function commandDisposition(wire, agent) {
+function commandDisposition(wire, agent, workflowRuntimeState = agent?.workflowRuntimeState) {
   if (!wire.targetInstanceId) return { disposition: "ignore", reason: "missing_target_instance_id" };
   if (wire.targetInstanceId !== agent.agentId) return { disposition: "ignore", reason: "target_mismatch" };
   const action = String(wire.action ?? "").trim();
   if (PROTECTED_ACTIONS.has(action.toLowerCase())) {
-    return { disposition: "reject", protectedAction: true, reason: "protected_action_requires_canonical_human_approval" };
+    const approvalRef = String(wire.command?.approvalRef ?? "").trim();
+    if (!CANONICAL_APPROVAL_REF.test(approvalRef) || wire.command?.requiresApproval !== true) {
+      return { disposition: "reject", protectedAction: true, reason: "protected_action_requires_canonical_human_approval" };
+    }
   }
-  if (!agent.capabilities.includes(action)) {
+  const advertised = workflowRunnerMetadata(agent, workflowRuntimeState);
+  const supported = new Set([...(advertised.capabilities ?? []), ...(advertised.supportedTools ?? [])]);
+  if (!supported.has(action)) {
     return { disposition: "reject", protectedAction: false, reason: "action_not_advertised_by_agent" };
   }
-  return { disposition: "accept", protectedAction: false };
+  return {
+    disposition: "accept",
+    protectedAction: PROTECTED_ACTIONS.has(action.toLowerCase()),
+    approvalRef: wire.command?.approvalRef ?? null,
+  };
+}
+
+function workflowEngineLifecycleResponse(event, context = {}) {
+  const eventType = String(event?.eventType ?? "UNKNOWN").toUpperCase();
+  const terminal = ["SUCCESS", "FAILED", "CANCELLED"].includes(eventType);
+  const failed = ["FAILED", "CANCELLED"].includes(eventType);
+  const checkpoint = eventType === "CHECKPOINT";
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+  const executionState = String(payload.terminalState ?? payload.state ?? eventType).toUpperCase();
+  return {
+    type: failed ? "NACK" : "ACK",
+    status: terminal ? (failed ? "failed" : "completed") : "progress",
+    reason: failed ? redactedText(payload.errorMessage ?? executionState) : null,
+    result: {
+      adapter: "workflow-engine-event-replay",
+      executed: terminal,
+      receiptOnly: false,
+      sequence: Number(event?.id ?? 0),
+      stream: "workflow",
+      eventType,
+      executionState,
+      checkpoint,
+      workflowExecutionId: String(event?.executionId ?? context.executionId ?? ""),
+      workflowRunnerId: event?.workflowRunnerId ?? context.workflowRunnerId ?? null,
+      leaseFence: event?.leaseFence ?? context.leaseFence ?? null,
+      checkpointRef: payload.checkpointRef ?? null,
+      artifact: payload,
+    },
+  };
 }
 
 class EvidenceLog {
@@ -294,8 +369,14 @@ class SwarmAgent {
     this.sequence = 0;
     this.inFlightCommands = new Map();
     this.completedCommands = new Map();
+    this.pendingControlMessages = new Map();
     this.forceAuthRefresh = false;
     this.grayMatterReplayActive = false;
+    this.workflowRuntimeState = { configured: Boolean(agent.workflowRuntime), healthy: false, status: "unchecked" };
+    this.agent.workflowRuntimeState = this.workflowRuntimeState;
+    this.workflowEngineEventCursor = 0;
+    this.workflowEngineActiveExecutions = new Map();
+    this.workflowEngineReplayActive = false;
     this.lastGrayMatterReplayAt = 0;
   }
 
@@ -350,7 +431,11 @@ class SwarmAgent {
       if (frame.command === "CONNECTED") {
         this.onConnected();
       } else if (frame.command === "MESSAGE") {
-        this.onMessage(frame.body);
+        if (frame.headers.subscription === controlReplyDestination(this.agent.agentId).id) {
+          this.onServerControlReply(frame.body);
+        } else {
+          this.onMessage(frame.body);
+        }
       } else if (frame.command === "ERROR") {
         this.evidence.record("stomp_error", {
           agentId: this.agent.agentId,
@@ -367,8 +452,13 @@ class SwarmAgent {
     for (const { destination, id } of commandDestinations(this.agent.agentId)) {
       this.subscribe(destination, id);
     }
-    this.sendRegistration();
-    this.startHeartbeat();
+    const controlReply = controlReplyDestination(this.agent.agentId);
+    this.subscribe(controlReply.destination, controlReply.id);
+    void this.refreshWorkflowRuntime().then(() => {
+      this.sendRegistration();
+      this.startHeartbeat();
+      void this.replayWorkflowEngineEvents();
+    });
     void this.replayGrayMatterReceipts(true);
     this.evidence.record("connected", {
       agentId: this.agent.agentId,
@@ -419,7 +509,7 @@ class SwarmAgent {
       sequence: ++this.sequence,
       timestamp: Date.now(),
     };
-    this.publish("/app/chat", {
+    this.publish(topic === "swarm" ? "/app/swarm/control" : "/app/chat", {
       id: crypto.randomUUID(),
       type: "broadcast",
       payload: JSON.stringify(envelope),
@@ -428,30 +518,49 @@ class SwarmAgent {
   }
 
   sendRegistration() {
-    this.sendAppTopic("swarm", this.swarmMessage("register", {
+    const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const workflowRuntimeReady = (runner.supportedTools ?? []).some((tool) =>
+      tool === "workflow.runner.execute-module" || tool === "workflow.engine.execute-workflow");
+    this.sendControlMessage("register", {
       announcement: {
         agentId: this.agent.agentId,
         runtime: this.agent.runtime,
         machineId: this.machineId,
         status: "healthy",
         capacity: Number(this.agent.capacity ?? 1),
-        capabilities: this.agent.capabilities,
+        ...runner,
         approvalPolicy: "human-approval-required",
-        executionAdapter: this.agent.execution?.adapter ?? "receipt-only",
-        receiptOnly: !this.agent.execution,
+        executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
+        receiptOnly: !this.agent.execution && !workflowRuntimeReady,
         version: this.agent.version ?? `valkyr-swarm/${PACKAGE_VERSION}`,
       },
-    }));
+    });
   }
 
   startHeartbeat() {
     clearInterval(this.heartbeatTimer);
-    this.sendHeartbeat();
-    this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), this.heartbeatSeconds * 1000);
+    void this.sendHeartbeat();
+    this.heartbeatTimer = setInterval(() => void this.sendHeartbeat(), this.heartbeatSeconds * 1000);
   }
 
-  sendHeartbeat() {
-    this.sendAppTopic("swarm", this.swarmMessage("heartbeat", {
+  async refreshWorkflowRuntime() {
+    this.workflowRuntimeState = await probeWorkflowRuntime(this.agent);
+    this.agent.workflowRuntimeState = this.workflowRuntimeState;
+    this.evidence.record("workflow_runtime_probe", {
+      agentId: this.agent.agentId,
+      configured: this.workflowRuntimeState.configured,
+      healthy: this.workflowRuntimeState.healthy,
+      status: this.workflowRuntimeState.status,
+      version: this.workflowRuntimeState.version ?? null,
+    });
+  }
+
+  async sendHeartbeat() {
+    await this.refreshWorkflowRuntime();
+    const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const workflowRuntimeReady = (runner.supportedTools ?? []).some((tool) =>
+      tool === "workflow.runner.execute-module" || tool === "workflow.engine.execute-workflow");
+    this.sendControlMessage("heartbeat", {
       instanceId: this.agent.agentId,
       agentId: this.agent.agentId,
       runtime: this.agent.runtime,
@@ -459,11 +568,129 @@ class SwarmAgent {
       status: "healthy",
       capacity: Number(this.agent.capacity ?? 1),
       activeTasks: this.inFlightCommands.size,
-      executionAdapter: this.agent.execution?.adapter ?? "receipt-only",
-      receiptOnly: !this.agent.execution,
-    }));
+      ...runner,
+      executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
+      receiptOnly: !this.agent.execution && !workflowRuntimeReady,
+    });
     this.evidence.record("heartbeat_sent", { agentId: this.agent.agentId, machineId: this.machineId });
     void this.replayGrayMatterReceipts(false);
+    void this.replayWorkflowEngineEvents();
+  }
+
+  async replayWorkflowEngineEvents() {
+    if (this.workflowEngineReplayActive
+        || this.workflowRuntimeState?.healthy !== true
+        || this.workflowRuntimeState?.supportedTools?.includes("workflow.engine.execute-workflow") !== true) {
+      return;
+    }
+    this.workflowEngineReplayActive = true;
+    try {
+      const replay = await forwardWorkflowEngineEventsOnce({
+        agent: this.agent,
+        apiBase: this.apiBase,
+        tokenProvider: this.tokenProvider,
+        after: this.workflowEngineEventCursor,
+        activeExecutions: this.workflowEngineActiveExecutions,
+        onProgress: (progress) => this.evidence.record("workflow_engine_event_replayed", {
+          agentId: this.agent.agentId,
+          detail: redactedText(progress.text),
+        }),
+        onEvent: async ({ event, context, terminal, checkpoint }) => {
+          const eventType = String(event?.eventType ?? "UNKNOWN").toUpperCase();
+          const executionId = String(event?.executionId ?? "unknown");
+          const eventId = Number(event?.id ?? 0);
+          const correlatedCommandId = typeof context?.commandId === "string"
+              && SAFE_IDENTIFIER.test(context.commandId)
+              && context.commandId.length <= MAX_IDENTIFIER_LENGTH
+            ? context.commandId
+            : `workflow-engine-${executionId}-${eventId}`.slice(0, MAX_IDENTIFIER_LENGTH);
+          const wire = {
+            action: "workflow.engine.execute-workflow",
+            commandId: correlatedCommandId,
+            trace: { traceId: context?.traceId ?? `workflow-execution:${executionId}` },
+            command: {
+              payload: {
+                workflowExecutionId: executionId,
+                workflowRunnerId: event?.workflowRunnerId ?? this.agent.agentId,
+                leaseFence: event?.leaseFence ?? null,
+              },
+            },
+          };
+          const lifecycle = workflowEngineLifecycleResponse(event, context);
+          const prior = this.completedCommands.get(correlatedCommandId);
+          const duplicateTerminal = terminal && prior?.status === lifecycle.status;
+          if (terminal || checkpoint) {
+            const handoff = await persistWorkflowHandoff({
+              agent: this.agent,
+              apiBase: this.apiBase,
+              tokenProvider: this.tokenProvider,
+              wire,
+              response: lifecycle,
+            });
+            lifecycle.result.grayMatterHandoffRef = handoff?.id ? `MemoryEntry:${handoff.id}` : null;
+            lifecycle.result.grayMatterHandoffStatus = handoff?.queued ? "queued" : "persisted";
+          }
+          if (!duplicateTerminal) {
+            if (terminal || checkpoint) {
+              const memoryReceipt = await this.persistTerminalReceipt(wire, lifecycle);
+              lifecycle.result.grayMatterReceiptRef = memoryReceipt.id
+                ? `MemoryEntry:${memoryReceipt.id}` : null;
+              lifecycle.result.grayMatterReceiptStatus = memoryReceipt.status;
+            }
+            this.rememberCompleted(correlatedCommandId, lifecycle);
+            this.sendCommandResponse(wire, lifecycle);
+          }
+          this.evidence.record("workflow_engine_lifecycle_forwarded", {
+            agentId: this.agent.agentId,
+            commandId: correlatedCommandId,
+            executionId,
+            eventId,
+            eventType,
+            status: lifecycle.status,
+            duplicateTerminal,
+          });
+        },
+      });
+      this.workflowEngineEventCursor = replay.next;
+      this.workflowEngineActiveExecutions = replay.activeExecutions;
+    } catch (error) {
+      this.evidence.record("workflow_engine_event_replay_deferred", {
+        agentId: this.agent.agentId,
+        after: this.workflowEngineEventCursor,
+        error: redactedError(error),
+      });
+    } finally {
+      this.workflowEngineReplayActive = false;
+    }
+  }
+
+  sendControlMessage(action, data) {
+    const message = this.swarmMessage(action, data);
+    const cutoff = Date.now() - 5 * 60 * 1000;
+    for (const [id, pending] of this.pendingControlMessages) {
+      if (pending.sentAt < cutoff) this.pendingControlMessages.delete(id);
+    }
+    this.pendingControlMessages.set(message.id, { action, sentAt: Date.now() });
+    this.sendAppTopic("swarm", message);
+    return message.id;
+  }
+
+  onServerControlReply(body) {
+    const reply = parseServerControlReply(body);
+    if (!reply) return;
+    const pending = this.pendingControlMessages.get(reply.ackId);
+    if (!pending) return;
+    this.pendingControlMessages.delete(reply.ackId);
+    const accepted = reply.topic === "ack" && reply.status !== "rejected";
+    this.evidence.record(`${pending.action}_${accepted ? "ack" : "nack"}`, {
+      agentId: this.agent.agentId,
+      messageId: reply.ackId,
+      status: reply.status || (accepted ? "ok" : "rejected"),
+      instanceId: reply.data.instanceId ?? null,
+      lastSeen: reply.data.lastSeen ?? null,
+      code: reply.code,
+      error: reply.error,
+    });
   }
 
   async replayGrayMatterReceipts(force) {
@@ -567,7 +794,7 @@ class SwarmAgent {
       return;
     }
 
-    const route = commandDisposition(wire, this.agent);
+    const route = commandDisposition(wire, this.agent, this.workflowRuntimeState);
     if (route.disposition === "ignore") {
       this.evidence.record("command_ignored", {
         action: wire.action,
@@ -621,7 +848,9 @@ class SwarmAgent {
       return;
     }
 
-    if (!this.agent.execution) {
+    const workflowRuntime = supportsWorkflowRuntimeAction(
+      this.agent, this.workflowRuntimeState, wire.action);
+    if (!this.agent.execution && !workflowRuntime) {
       const received = {
         type: "ACK",
         status: "pilot_received",
@@ -641,32 +870,30 @@ class SwarmAgent {
       return;
     }
 
+    const adapter = workflowRuntime ? "workflow-runtime-http" : this.agent.execution?.adapter;
     this.sendCommandResponse(wire, {
       type: "ACK",
       status: "started",
       result: {
-        adapter: this.agent.execution.adapter,
+        adapter,
         executed: false,
         receiptOnly: false,
       },
     });
     this.evidence.record("command_started", {
       action: wire.action,
-      adapter: this.agent.execution.adapter,
+      adapter,
       agentId: this.agent.agentId,
       commandId: wire.commandId,
       traceId: wire.trace?.traceId,
     });
     let progressSequence = 0;
-    const execution = executeRuntimeCommand({
-      agent: this.agent,
-      wire,
-      onProgress: (progress) => {
+    const onProgress = (progress) => {
         const response = {
           type: "ACK",
           status: "progress",
           result: {
-            adapter: this.agent.execution.adapter,
+            adapter,
             executed: false,
             receiptOnly: false,
             sequence: ++progressSequence,
@@ -683,9 +910,42 @@ class SwarmAgent {
           stream: progress.stream,
           traceId: wire.trace?.traceId,
         });
-      },
-    })
+      };
+    const execution = (workflowRuntime
+      ? executeWorkflowRuntimeCommand({
+          agent: this.agent,
+          wire,
+          apiBase: this.apiBase,
+          tokenProvider: this.tokenProvider,
+          onProgress,
+        })
+      : executeRuntimeCommand({ agent: this.agent, wire, onProgress }))
       .then(async (result) => {
+        const engineState = wire.action === "workflow.engine.execute-workflow"
+          ? String(result?.terminalState ?? "SUCCESS").toUpperCase()
+          : "SUCCESS";
+        if (!["SUCCESS", "FAILED", "CANCELLED", "TIMEOUT"].includes(engineState)) {
+          const suspended = {
+            type: "ACK",
+            status: "progress",
+            result: {
+              ...result,
+              executed: false,
+              executionState: engineState,
+              checkpoint: true,
+            },
+          };
+          this.rememberCompleted(wire.commandId, suspended);
+          this.sendCommandResponse(wire, suspended);
+          this.evidence.record("command_checkpointed", {
+            action: wire.action,
+            agentId: this.agent.agentId,
+            commandId: wire.commandId,
+            executionState: engineState,
+            traceId: wire.trace?.traceId,
+          });
+          return;
+        }
         const completed = { type: "ACK", status: "completed", result };
         const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
         completed.result = {
@@ -710,7 +970,7 @@ class SwarmAgent {
           status: "failed",
           reason: redactedError(error),
           result: {
-            adapter: this.agent.execution.adapter,
+            adapter,
             executed: false,
             receiptOnly: false,
           },
@@ -999,12 +1259,15 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 export {
   commandDestinations,
   commandDisposition,
+  controlReplyDestination,
   createTokenProvider,
   normalizeWebSocketUrl,
   parseStompFrame,
+  parseServerControlReply,
   parseWireCommand,
   readKeychainToken,
   redactedError,
   stompFrame,
   validateConfig,
+  workflowEngineLifecycleResponse,
 };

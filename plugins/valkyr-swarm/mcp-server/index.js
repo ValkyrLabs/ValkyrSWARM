@@ -22,7 +22,7 @@ import {
 } from "../scripts/swarm-graymatter.mjs";
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
-const SERVER_INFO = { name: "valkyr-swarm", version: "0.3.0" };
+const SERVER_INFO = { name: "valkyr-swarm", version: "0.4.0" };
 
 const TOOLS = [
   {

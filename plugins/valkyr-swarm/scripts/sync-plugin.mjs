@@ -30,6 +30,7 @@ for (const relative of [
   "scripts/swarm-login.mjs",
   "scripts/swarm-openclaw-bootstrap.mjs",
   "scripts/swarm-service.mjs",
+  "scripts/swarm-workflow-service.mjs",
   "scripts/sync-plugin.mjs",
   "scripts/verify-distribution.mjs",
 ]) {

@@ -28,7 +28,7 @@ test("MCP initialize and tool discovery expose the bounded SWARM surface", async
   const client = {};
   const initialized = await handleMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, client);
   assert.equal(initialized.result.serverInfo.name, "valkyr-swarm");
-  assert.equal(initialized.result.serverInfo.version, "0.3.0");
+  assert.equal(initialized.result.serverInfo.version, "0.4.0");
   const listed = await handleMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, client);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), TOOLS.map((tool) => tool.name));
 });

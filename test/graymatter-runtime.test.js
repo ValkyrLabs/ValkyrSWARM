@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   commandReceiptText,
   persistCommandReceipt,
+  persistWorkflowHandoff,
   queryMemory,
   replayQueuedReceipts,
   writeMemory,
@@ -43,6 +44,49 @@ test("runtime persists a bounded tenant-derived GrayMatter terminal receipt", as
   assert.equal(captured.body.sourceMessageId, "swarm-command:cmd-1:completed");
   assert.equal(JSON.parse(captured.body.text).protectedAction, false);
   assert.match(captured.headers.Authorization, /^Bearer /);
+});
+
+test("durable workflow lifecycle synchronizes a bounded shared GrayMatter handoff", async () => {
+  let captured;
+  const memory = await persistWorkflowHandoff({
+    agent: { agentId: "valor-engine", runtime: "valoride" },
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "test-token",
+    wire: {
+      action: "workflow.engine.execute-workflow",
+      commandId: "cmd-engine-1",
+      trace: { traceId: "workflow-execution:execution-1" },
+    },
+    response: {
+      type: "ACK",
+      status: "progress",
+      result: {
+        sequence: 9,
+        eventType: "CHECKPOINT",
+        executionState: "WAITING_APPROVAL",
+        workflowExecutionId: "execution-1",
+        workflowRunnerId: "runner-1",
+        leaseFence: 4,
+        checkpointRef: "engine-checkpoint:execution-1:approval:module-1",
+        artifact: { credentials: { token: "must-not-survive" } },
+      },
+    },
+    fetchImpl: async (url, options) => {
+      captured = { url, body: JSON.parse(options.body) };
+      return new Response(JSON.stringify({ id: "handoff-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  assert.equal(memory.id, "handoff-1");
+  assert.equal(captured.body.sourceChannel, "valkyr-swarm:handoff");
+  assert.equal(captured.body.sourceMessageId,
+    "swarm-workflow:execution-1:9:waiting_approval");
+  const handoff = JSON.parse(captured.body.text);
+  assert.equal(handoff.executionState, "WAITING_APPROVAL");
+  assert.equal(handoff.checkpointRef, "engine-checkpoint:execution-1:approval:module-1");
+  assert.equal(captured.body.text.includes("must-not-survive"), false);
 });
 
 test("shared handoff writes and invariant queries stay scoped to GrayMatter APIs", async () => {
@@ -86,6 +130,23 @@ test("command receipt text is deterministic in shape and bounded", () => {
   assert.equal(parsed.status, "failed");
 });
 
+test("protected command receipts retain the canonical approval binding", () => {
+  const approvalRef = `gm_approval_${"c".repeat(64)}`;
+  const text = commandReceiptText({
+    agent: { agentId: "codex-host", runtime: "codex" },
+    wire: {
+      commandId: "cmd-approved-merge",
+      action: "merge",
+      command: { requiresApproval: true, approvalRef },
+      trace: { traceId: "trace-approved-merge" },
+    },
+    response: { type: "ACK", status: "completed", result: { executed: true } },
+  });
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.protectedAction, true);
+  assert.equal(parsed.approvalRef, approvalRef);
+});
+
 test("durable receipts summarize verbose runtime event streams", () => {
   const output = [
     JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Verified rc-7 is dirty." } }),
@@ -105,6 +166,45 @@ test("durable receipts summarize verbose runtime event streams", () => {
   assert.equal(parsed.result.artifact.eventCount, 2);
   assert.equal(text.includes("x".repeat(1_000)), false);
   assert.ok(text.length < 4_000);
+});
+
+test("remote workflow receipts retain bounded redacted structured outputs", () => {
+  const text = commandReceiptText({
+    agent: { agentId: "workflow-host", runtime: "valoride" },
+    wire: {
+      commandId: "cmd-workflow",
+      action: "workflow.runner.execute-module",
+      trace: { traceId: "trace-workflow" },
+    },
+    response: {
+      type: "ACK",
+      status: "completed",
+      result: {
+        adapter: "workflow-runtime-http",
+        executed: true,
+        workflowRunId: "run-1",
+        workflowRunnerId: "runner-1",
+        leaseFence: 7,
+        artifact: {
+          executiveSummary: "Completed the bounded analysis",
+          metrics: { conversionRate: 0.42 },
+          credentials: { apiToken: "must-not-survive" },
+          note: "Authorization=must-not-survive-either",
+        },
+      },
+    },
+  });
+
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.result.workflowRunId, "run-1");
+  assert.equal(parsed.result.leaseFence, 7);
+  const structured = JSON.parse(parsed.result.artifact.structuredSummary);
+  assert.equal(structured.executiveSummary, "Completed the bounded analysis");
+  assert.equal(structured.metrics.conversionRate, 0.42);
+  assert.equal(structured.credentials, "[REDACTED]");
+  assert.equal(structured.note, "Authorization=[REDACTED]");
+  assert.equal(text.includes("must-not-survive"), false);
+  assert.ok(text.length < 12_000);
 });
 
 test("credit-gated receipts enter a private replay queue and later persist", async () => {

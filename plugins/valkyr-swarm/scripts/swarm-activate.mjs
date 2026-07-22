@@ -22,19 +22,64 @@ import {
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_SCRIPT = path.join(SCRIPT_DIR, "swarm-agent.mjs");
 const SERVICE_SCRIPT = path.join(SCRIPT_DIR, "swarm-service.mjs");
+const WORKFLOW_SERVICE_SCRIPT = path.join(SCRIPT_DIR, "swarm-workflow-service.mjs");
+const WORKFLOW_RELEASE_PROTOCOL = "valkyr-workflow-runtime-release/v1";
+const WORKFLOW_RUNNER_PROTOCOL = "valkyr-workflow-runner/v1";
+const WORKFLOW_ENGINE_PROTOCOL = "valkyr-workflow-engine/v1";
 
 const DEFAULT_CAPABILITIES = {
-  "claude-code": ["code.execute", "pr.review", "workflow.debug"],
-  codex: ["code.execute", "pr.review", "workflow.debug"],
-  openclaw: ["task.write", "workflow.debug"],
-  valoride: ["code.execute", "pr.review", "workflow.debug"],
-  valklaw: ["task.write", "code.execute", "pr.review", "workflow.debug"],
+  "claude-code": ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workspace.files.read"],
+  codex: ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workspace.files.read"],
+  openclaw: [
+    "task.write", "market.research", "crm.write", "inbound.triage", "cms.write",
+    "outbound.send", "workflow.debug", "openclaw.skill.execute",
+    "openclaw.research-draft.execute",
+  ],
+  valoride: ["code.execute", "engineering.project.execute", "pr.review", "production.deploy", "workflow.debug", "workspace.files.read"],
+  valklaw: ["task.write", "code.execute", "engineering.project.execute", "pr.review", "workflow.debug", "openclaw.skill.execute", "openclaw.research-draft.execute", "workspace.files.read"],
   agent: ["task.write", "workflow.debug"],
 };
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: node scripts/swarm-activate.mjs [options]\n\nAuthenticates, creates or updates a production tenant SWARM config, and starts its supervised bridge.\nFor unattended first use, set VALKYR_USERNAME and VALKYR_PASSWORD.\n\nOptions:\n  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw\n  --agent-id <id>             Default <runtime>-<machine-id>\n  --machine-id <id>           Default normalized hostname\n  --capabilities <csv>        Runtime-safe defaults when omitted\n  --capacity <n>              Default 1\n  --api-base <url>            Production api-0; non-production requires --test-mode\n  --config <path>             Default ~/.config/valkyr-swarm/agent-<machine-id>.json\n  --receipt-log <path>        Default platform log directory\n  --runtime-agent-id <id>     Local runtime identity (OpenClaw/ValorIDE/etc.)\n  --runtime-executable <path> Override auto-discovered runtime CLI\n  --workspace <path>          Runtime working directory\n  --receipt-only              Explicitly disable local execution\n  --replace-agent             Replace, rather than merge, the machine agent set\n  --test-mode                 Allow an isolated non-production endpoint\n  --foreground                Run attached instead of installing supervision\n  --no-service                Create/authenticate only; do not start\n  --dry-run                   Print the non-secret plan without login or writes\n  --self-test                 Validate discovery/config contracts offline\n  -h, --help                  Show this help\n\nProtected outbound.send, production.deploy, and merge actions remain denied locally.\n`);
+  stream.write(`Usage: node scripts/swarm-activate.mjs [options]
+
+Authenticates, creates or updates a production tenant SWARM config, and starts its supervised bridge.
+For unattended first use, set VALKYR_USERNAME and VALKYR_PASSWORD.
+
+Options:
+  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw
+  --agent-id <id>             Default <runtime>-<machine-id>
+  --machine-id <id>           Default normalized hostname
+  --capabilities <csv>        Runtime-safe defaults when omitted
+  --capacity <n>              Default 1
+  --api-base <url>            Production api-0; non-production requires --test-mode
+  --config <path>             Default ~/.config/valkyr-swarm/agent-<machine-id>.json
+  --receipt-log <path>        Default platform log directory
+  --runtime-agent-id <id>     Local runtime identity (OpenClaw/ValorIDE/etc.)
+  --runtime-executable <path> Override auto-discovered runtime CLI
+  --workspace <path>          Runtime working directory
+  --workflow-runtime          Install ValkyrAI's approved local Workflow runner
+  --workflow-engine           Install the approved durable mini-ValkyrAI engine
+  --workflow-artifact-url <u> Optional approved-release override (with SHA-256)
+  --workflow-artifact-sha256  SHA-256 paired with the artifact override
+  --workflow-runtime-port <n> Loopback runtime port (default 8765)
+  --workflow-runtime-max-heap Override the release-recommended bounded heap
+  --workflow-credential-refs  Comma-separated node-owned Keychain/systemd references
+  --deployment-runner-endpoint Exact node-local deployment runner execute endpoint
+  --deployment-credential-ref Optional node-owned deployment credential reference
+  --receipt-only              Explicitly disable local execution
+  --replace-agent             Replace, rather than merge, the machine agent set
+  --test-mode                 Allow an isolated non-production endpoint
+  --foreground                Run attached instead of installing supervision
+  --no-service                Create/authenticate only; do not start
+  --dry-run                   Print the non-secret plan without login or writes
+  --self-test                 Validate discovery/config contracts offline
+  -h, --help                  Show this help
+
+Protected outbound.send, production.deploy, and merge actions require an exact
+content-bound human approval reference from the authenticated mothership.
+`);
   process.exit(exitCode);
 }
 
@@ -44,11 +89,14 @@ function parseArgs(argv) {
     "--runtime", "--agent-id", "--machine-id", "--capabilities", "--capacity",
     "--api-base", "--config", "--receipt-log", "--openclaw-agent-id",
     "--runtime-agent-id", "--runtime-executable", "--workspace",
+    "--workflow-artifact-url", "--workflow-artifact-sha256", "--workflow-runtime-port",
+    "--workflow-runtime-max-heap", "--workflow-credential-refs",
+    "--deployment-runner-endpoint", "--deployment-credential-ref",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") usage(0);
-    if (["--foreground", "--no-service", "--dry-run", "--self-test", "--receipt-only", "--replace-agent", "--test-mode"].includes(arg)) {
+    if (["--foreground", "--no-service", "--dry-run", "--self-test", "--receipt-only", "--replace-agent", "--test-mode", "--workflow-runtime", "--workflow-engine"].includes(arg)) {
       options[arg.slice(2).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = true;
       continue;
     }
@@ -91,6 +139,44 @@ function parseCapabilities(value, runtime) {
     if (capability.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(capability)) throw new Error(`Capability contains unsupported characters: ${capability}`);
   }
   return unique;
+}
+
+function parseWorkflowRuntimeMaxHeap(value = "512m") {
+  const normalized = String(value).trim().toLowerCase();
+  const match = /^(\d+)(m|g)$/.exec(normalized);
+  if (!match) {
+    throw new Error("workflow runtime max heap must use a whole-number m or g suffix");
+  }
+  const amount = Number(match[1]);
+  const mebibytes = match[2] === "g" ? amount * 1024 : amount;
+  if (!Number.isSafeInteger(mebibytes) || mebibytes < 256 || mebibytes > 8192) {
+    throw new Error("workflow runtime max heap must be between 256m and 8g");
+  }
+  return normalized;
+}
+
+function parseWorkflowCredentialReferences(value) {
+  if (value == null || String(value).trim() === "") return [];
+  const references = [...new Set(String(value).split(",").map((item) => item.trim()).filter(Boolean))];
+  if (references.length > 32) throw new Error("workflow credential references must contain at most 32 entries");
+  for (const reference of references) {
+    if (!/^(?:keychain:[A-Za-z0-9._-]{1,128}:[A-Za-z0-9._-]{1,128}|credential:[A-Za-z0-9._-]{1,128})$/.test(reference)) {
+      throw new Error(`Workflow credential reference is invalid: ${reference}`);
+    }
+  }
+  return references.sort();
+}
+
+function parseDeploymentRunnerEndpoint(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const endpoint = new URL(String(value));
+  if (endpoint.protocol !== "http:"
+      || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(endpoint.hostname)
+      || endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+      || endpoint.pathname !== "/api/deployments/execute") {
+    throw new Error("deployment runner endpoint must be exact loopback HTTP /api/deployments/execute");
+  }
+  return endpoint.toString();
 }
 
 function commandPath(name) {
@@ -183,8 +269,119 @@ function buildConfig(options) {
     capacity,
     capabilities: parseCapabilities(options.capabilities, runtime),
   };
+  const deploymentRunnerEndpoint = parseDeploymentRunnerEndpoint(
+    options.deploymentRunnerEndpoint ?? process.env.VALKYR_DEPLOYMENT_RUNNER_ENDPOINT,
+  );
+  const deploymentCredentialRef = options.deploymentCredentialRef
+    ?? process.env.VALKYR_DEPLOYMENT_CREDENTIAL_REF;
+  if ((deploymentRunnerEndpoint || deploymentCredentialRef) && !options.workflowEngine) {
+    throw new Error("The productized deployment runner requires the durable Workflow engine tier");
+  }
+  if (deploymentCredentialRef && !deploymentRunnerEndpoint) {
+    throw new Error("A deployment credential reference requires a configured deployment runner endpoint");
+  }
+  if (deploymentRunnerEndpoint && !agent.capabilities.includes("production.deploy")) {
+    throw new Error("The deployment runner requires an explicit production.deploy node capability");
+  }
+  if (deploymentCredentialRef) {
+    parseWorkflowCredentialReferences(deploymentCredentialRef);
+  }
+  if (deploymentRunnerEndpoint
+      && !agent.capabilities.includes("deployment.runner.execute")) {
+    agent.capabilities.push("deployment.runner.execute");
+  }
   const execution = executionConfig(runtime, options, agentId, machineId);
   if (execution) agent.execution = execution;
+  if (options.workflowRuntime && options.workflowEngine) {
+    throw new Error("Choose either the stateless Workflow runner or durable Workflow engine tier");
+  }
+  const workflowRuntimeRequested = options.workflowRuntime || options.workflowEngine
+    || options.workflowArtifactUrl
+    || process.env.VALKYR_WORKFLOW_RUNTIME_ARTIFACT_URL
+    || process.env.VALKYR_WORKFLOW_RUNTIME_ARTIFACT_SHA256;
+  if (workflowRuntimeRequested) {
+    const tier = options.workflowEngine ? "engine" : "runner";
+    const credentialReferences = parseWorkflowCredentialReferences(
+      options.workflowCredentialRefs ?? process.env.VALKYR_WORKFLOW_CREDENTIAL_REFS,
+    );
+    if (deploymentCredentialRef && !credentialReferences.includes(deploymentCredentialRef)) {
+      credentialReferences.push(deploymentCredentialRef);
+      credentialReferences.sort();
+    }
+    if (tier !== "engine" && credentialReferences.length > 0) {
+      throw new Error("The stateless Workflow runner does not accept credential references");
+    }
+    const artifactUrl = options.workflowArtifactUrl ?? process.env.VALKYR_WORKFLOW_RUNTIME_ARTIFACT_URL;
+    const sha256 = options.workflowArtifactSha256 ?? process.env.VALKYR_WORKFLOW_RUNTIME_ARTIFACT_SHA256;
+    if (Boolean(artifactUrl) !== Boolean(sha256)) {
+      throw new Error("Workflow runtime artifact URL and SHA-256 overrides must be supplied together");
+    }
+    const port = Number(options.workflowRuntimePort ?? process.env.VALKYR_WORKFLOW_RUNTIME_PORT
+      ?? (tier === "engine" ? 8767 : 8765));
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw new Error("workflow runtime port must be between 1024 and 65535");
+    }
+    const heapOverride = options.workflowRuntimeMaxHeap
+      ?? process.env.VALKYR_WORKFLOW_RUNTIME_MAX_HEAP;
+    // Existing releases booted the full application and required this conservative fallback.
+    // New releases advertise a measured slim-runner heap during authenticated discovery.
+    const maximumHeap = parseWorkflowRuntimeMaxHeap(heapOverride ?? "3g");
+    agent.workflowRuntime = {
+      enabled: true,
+      tier,
+      endpoint: tier === "engine"
+        ? `http://127.0.0.1:${port}/v1/swarm/workflow-engine/execute`
+        : `http://127.0.0.1:${port}/v1/swarm/workflow-runs/execute`,
+      healthEndpoint: tier === "engine"
+        ? `http://127.0.0.1:${port}/v1/swarm/workflow-engine/health`
+        : `http://127.0.0.1:${port}/v1/swarm/workflow-runs/health`,
+      timeoutSeconds: 900,
+      capabilities: ["java:17", "graymatter.context"],
+      ...(tier === "engine" && execution?.workingDirectory
+        ? { workspaceRoots: [execution.workingDirectory] }
+        : {}),
+      ...(credentialReferences.length > 0 ? { credentialReferences } : {}),
+      supportedTools: [tier === "engine"
+        ? "workflow.engine.execute-workflow"
+        : "workflow.runner.execute-module"],
+      allowedEnvironments: deploymentRunnerEndpoint
+          && agent.capabilities.includes("production.deploy")
+        ? ["sandbox", "staging", "production"]
+        : ["sandbox", "staging"],
+      allowedDataClassifications: ["internal"],
+      privacyZones: ["internal"],
+      networkZones: ["loopback"],
+      maxConcurrency: capacity,
+      estimatedCost: 0,
+      estimatedLatencyMs: 100,
+      trustScore: 0.9,
+      localExecution: true,
+      leaseDurationSeconds: 120,
+      ...(deploymentRunnerEndpoint ? {
+        deploymentRunner: {
+          endpoint: deploymentRunnerEndpoint,
+          healthEndpoint: new URL("/api/deployments/health", deploymentRunnerEndpoint).toString(),
+          protocol: "valkyr-deployment-runner/v1",
+          ...(deploymentCredentialRef ? { credentialReference: deploymentCredentialRef } : {}),
+        },
+      } : {}),
+      install: {
+        tier,
+        ...(artifactUrl ? {
+          artifactUrl,
+          sha256: String(sha256).toLowerCase(),
+        } : { releaseDiscovery: true }),
+        minimumJavaVersion: 17,
+        artifactPath: path.join(
+          os.homedir(), ".local", "share", "valkyr-swarm", "workflow-runtimes", `${agentId}.jar`),
+        javaExecutable: process.env.JAVA_HOME
+          ? path.join(process.env.JAVA_HOME, "bin", "java") : "java",
+        jvmArgs: ["-Xms128m", `-Xmx${maximumHeap}`],
+        ...(heapOverride == null && !artifactUrl ? { useReleaseRecommendedHeap: true } : {}),
+        arguments: [],
+      },
+    };
+  }
   return {
     apiBase,
     configPath,
@@ -247,8 +444,203 @@ async function authenticate(target) {
   return token;
 }
 
-function startForeground(target, token) {
-  const child = spawn(process.execPath, [
+function validateWorkflowReleaseDescriptor(value, expectedTier = "runner") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Workflow runtime release response must be an object");
+  }
+  if (value.protocol !== WORKFLOW_RELEASE_PROTOCOL) {
+    throw new Error(`Unsupported Workflow runtime release protocol: ${String(value.protocol ?? "missing")}`);
+  }
+  const tier = String(value.tier ?? "runner");
+  if (tier !== expectedTier || !["runner", "engine"].includes(tier)) {
+    throw new Error(`Workflow runtime release tier mismatch: ${tier}`);
+  }
+  const runtimeProtocol = String(value.runtimeProtocol
+    ?? value.runnerProtocol
+    ?? (tier === "engine" ? value.engineProtocol : ""));
+  const expectedRuntimeProtocol = tier === "engine" ? WORKFLOW_ENGINE_PROTOCOL : WORKFLOW_RUNNER_PROTOCOL;
+  if (runtimeProtocol !== expectedRuntimeProtocol) {
+    throw new Error(`Unsupported Workflow ${tier} protocol: ${runtimeProtocol || "missing"}`);
+  }
+  const version = String(value.version ?? "").trim();
+  if (!version || version.length > 128 || /[\r\n\0]/.test(version)) {
+    throw new Error("Workflow runtime release version is invalid");
+  }
+  const artifactUrl = new URL(String(value.artifactUrl ?? ""));
+  if (artifactUrl.protocol !== "https:"
+      || !artifactUrl.hostname
+      || artifactUrl.username
+      || artifactUrl.password
+      || artifactUrl.search
+      || artifactUrl.hash) {
+    throw new Error("Workflow runtime release artifact URL must be credential-free HTTPS");
+  }
+  const sha256 = String(value.sha256 ?? "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error("Workflow runtime release SHA-256 is invalid");
+  }
+  const minimumJavaVersion = Number(value.minimumJavaVersion);
+  if (!Number.isInteger(minimumJavaVersion) || minimumJavaVersion < 17 || minimumJavaVersion > 99) {
+    throw new Error("Workflow runtime minimum Java version is invalid");
+  }
+  let recommendedMaxHeap = null;
+  if (value.recommendedMaxHeap != null) {
+    try {
+      recommendedMaxHeap = parseWorkflowRuntimeMaxHeap(value.recommendedMaxHeap);
+    } catch {
+      throw new Error("Workflow runtime recommended max heap is invalid");
+    }
+  }
+  const capabilityPacks = validateCapabilityPackReleases(value.capabilityPacks, tier);
+  return {
+    artifactUrl: artifactUrl.toString(),
+    capabilityPacks,
+    minimumJavaVersion,
+    ...(tier === "runner" ? { runnerProtocol: WORKFLOW_RUNNER_PROTOCOL } : { engineProtocol: WORKFLOW_ENGINE_PROTOCOL }),
+    runtimeProtocol: expectedRuntimeProtocol,
+    tier,
+    recommendedMaxHeap,
+    sha256,
+    version,
+  };
+}
+
+function validateCapabilityPackReleases(value, tier) {
+  if (value == null) return [];
+  if (!Array.isArray(value) || value.length > 32) {
+    throw new Error("Workflow capability pack release list is invalid");
+  }
+  if (tier !== "engine" && value.length > 0) {
+    throw new Error("The stateless Workflow runner release must not include capability packs");
+  }
+  const ids = new Set();
+  return value.map((pack) => {
+    if (!pack || typeof pack !== "object" || Array.isArray(pack)) {
+      throw new Error("Workflow capability pack release must be an object");
+    }
+    const id = String(pack.id ?? "").trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id) || id === "core-transforms" || ids.has(id)) {
+      throw new Error(`Workflow capability pack release id is invalid or duplicated: ${id || "missing"}`);
+    }
+    ids.add(id);
+    const version = String(pack.version ?? "").trim();
+    if (!version || version.length > 64 || !/^[A-Za-z0-9._-]+$/.test(version)) {
+      throw new Error(`Workflow capability pack ${id} version is invalid`);
+    }
+    const artifactUrl = new URL(String(pack.artifactUrl ?? ""));
+    if (artifactUrl.protocol !== "https:"
+        || !artifactUrl.hostname
+        || artifactUrl.username
+        || artifactUrl.password
+        || artifactUrl.search
+        || artifactUrl.hash) {
+      throw new Error(`Workflow capability pack ${id} artifact URL must be credential-free HTTPS`);
+    }
+    const sha256 = String(pack.sha256 ?? "").trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      throw new Error(`Workflow capability pack ${id} SHA-256 is invalid`);
+    }
+    const requiredNodeCapabilities = pack.requiredNodeCapabilities == null
+      ? []
+      : pack.requiredNodeCapabilities;
+    if (!Array.isArray(requiredNodeCapabilities) || requiredNodeCapabilities.length > 32) {
+      throw new Error(`Workflow capability pack ${id} required node capabilities are invalid`);
+    }
+    const normalizedCapabilities = [...new Set(requiredNodeCapabilities.map((capability) => {
+      const normalized = String(capability ?? "").trim().toLowerCase();
+      if (!/^[a-z0-9][a-z0-9._:-]{0,63}$/.test(normalized)) {
+        throw new Error(`Workflow capability pack ${id} required node capability is invalid`);
+      }
+      return normalized;
+    }))].sort();
+    return {
+      id,
+      version,
+      artifactUrl: artifactUrl.toString(),
+      sha256,
+      ...(normalizedCapabilities.length > 0
+        ? { requiredNodeCapabilities: normalizedCapabilities }
+        : {}),
+    };
+  });
+}
+
+function selectCapabilityPacksForAgent(capabilityPacks, agent) {
+  const available = new Set([
+    ...(agent?.capabilities ?? []),
+    ...(agent?.workflowRuntime?.capabilities ?? []),
+  ].map((capability) => String(capability).trim().toLowerCase()));
+  const selected = [];
+  const skipped = [];
+  for (const pack of capabilityPacks ?? []) {
+    const missing = (pack.requiredNodeCapabilities ?? [])
+      .filter((capability) => !available.has(capability));
+    if (missing.length === 0) selected.push(pack);
+    else skipped.push({ id: pack.id, missingCapabilities: missing });
+  }
+  return { selected, skipped };
+}
+
+async function resolveWorkflowRuntimeRelease(target, token, fetchImpl = fetch) {
+  const pending = target.config.agents.filter(
+    (agent) => agent.workflowRuntime?.enabled && agent.workflowRuntime.install?.releaseDiscovery === true,
+  );
+  if (pending.length === 0) return target;
+  if (!token) throw new Error("Authentication is required to discover the Workflow runtime release");
+  for (const agent of pending) {
+    const tier = agent.workflowRuntime?.install?.tier === "engine" ? "engine" : "runner";
+    const releaseUrl = tier === "runner"
+      ? `${target.apiBase}/swarm/workflow-runtime/release`
+      : `${target.apiBase}/swarm/workflow-runtime/release?tier=engine`;
+    const response = await fetchImpl(releaseUrl, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Workflow ${tier} release discovery failed with HTTP ${response.status}`);
+    }
+    const release = validateWorkflowReleaseDescriptor(await response.json(), tier);
+    const packSelection = selectCapabilityPacksForAgent(release.capabilityPacks, agent);
+    release.capabilityPacks = packSelection.selected;
+    if (packSelection.skipped.length > 0) {
+      agent.workflowRuntime.install.skippedCapabilityPacks = packSelection.skipped;
+    } else {
+      delete agent.workflowRuntime.install.skippedCapabilityPacks;
+    }
+    if (agent.workflowRuntime.install.useReleaseRecommendedHeap && release.recommendedMaxHeap) {
+      agent.workflowRuntime.install.jvmArgs = ["-Xms64m", `-Xmx${release.recommendedMaxHeap}`];
+    }
+    delete agent.workflowRuntime.install.useReleaseRecommendedHeap;
+    delete agent.workflowRuntime.install.releaseDiscovery;
+    Object.assign(agent.workflowRuntime.install, release);
+  }
+  return target;
+}
+
+function workflowRuntimeForegroundArguments(configPath, agentId) {
+  return [
+    WORKFLOW_SERVICE_SCRIPT,
+    "foreground",
+    "--config", configPath,
+    "--agent", agentId,
+  ];
+}
+
+function startWorkflowRuntimeForeground(target, requestedAgentId, spawnImpl = spawn) {
+  return target.config.agents
+    .filter((agent) => agent.workflowRuntime?.enabled && agent.agentId === requestedAgentId)
+    .map((agent) => spawnImpl(
+      process.execPath,
+      workflowRuntimeForegroundArguments(target.configPath, agent.agentId),
+      { stdio: "inherit" },
+    ));
+}
+
+function startForeground(target, token, workflowChildren = [], spawnImpl = spawn) {
+  const bridge = spawnImpl(process.execPath, [
     AGENT_SCRIPT,
     "--config", target.configPath,
     "--receipt-log", target.receiptLog,
@@ -257,7 +649,43 @@ function startForeground(target, token) {
     env: { ...process.env, VALKYR_AUTH_TOKEN: token },
     stdio: "inherit",
   });
-  child.once("exit", (code, signal) => process.exitCode = signal ? 1 : code ?? 1);
+  const children = [bridge, ...workflowChildren];
+  let stopping = false;
+  const stopAll = (signal, exitCode, exitedChild = null) => {
+    if (!stopping) {
+      stopping = true;
+      process.exitCode = exitCode;
+    }
+    for (const child of children) {
+      if (child !== exitedChild && !child.killed) child.kill(signal);
+    }
+  };
+  const signals = ["SIGINT", "SIGTERM"];
+  const handlers = new Map(signals.map((signal) => [signal, () => {
+    stopAll(signal, signal === "SIGINT" ? 130 : 143);
+  }]));
+  for (const signal of signals) process.once(signal, handlers.get(signal));
+  const cleanupIfStopped = () => {
+    if (!stopping) return;
+    if (children.some((child) => child.exitCode == null && child.signalCode == null && !child.killed)) return;
+    for (const signal of signals) process.removeListener(signal, handlers.get(signal));
+  };
+  for (const child of children) {
+    child.once("error", (error) => {
+      process.stderr.write(`Valkyr SWARM foreground child failed: ${error.message}\n`);
+      stopAll("SIGTERM", 1, child);
+      cleanupIfStopped();
+    });
+    child.once("exit", (code, signal) => {
+      if (!stopping) {
+        const bridgeExitCode = signal ? 1 : code ?? 1;
+        const unexpectedRuntimeExit = child !== bridge && bridgeExitCode === 0;
+        stopAll("SIGTERM", unexpectedRuntimeExit ? 1 : bridgeExitCode, child);
+      }
+      cleanupIfStopped();
+    });
+  }
+  return children;
 }
 
 function installService(target) {
@@ -272,6 +700,20 @@ function installService(target) {
     "--credential-file", target.credentialFile,
   ], { stdio: "inherit" });
   if (result.status !== 0) throw new Error("SWARM service installation failed");
+}
+
+function installWorkflowRuntime(target, requestedAgentId) {
+  for (const agent of target.config.agents.filter(
+    (value) => value.workflowRuntime?.enabled && value.agentId === requestedAgentId,
+  )) {
+    const result = spawnSync(process.execPath, [
+      WORKFLOW_SERVICE_SCRIPT,
+      "install",
+      "--config", target.configPath,
+      "--agent", agent.agentId,
+    ], { stdio: "inherit" });
+    if (result.status !== 0) throw new Error(`Workflow runtime installation failed for ${agent.agentId}`);
+  }
 }
 
 function selfTest() {
@@ -317,6 +759,7 @@ async function main() {
     return;
   }
   const token = await authenticate(target);
+  await resolveWorkflowRuntimeRelease(target, token);
   writeConfig(target);
   if (options.noService) {
     process.stdout.write(`${JSON.stringify({ ...summary, authenticated: true, started: false })}\n`);
@@ -324,9 +767,11 @@ async function main() {
   }
   if (options.foreground || !["darwin", "linux"].includes(process.platform)) {
     process.stdout.write(`${JSON.stringify({ ...summary, authenticated: true, started: true })}\n`);
-    startForeground(target, token);
+    const workflowChildren = startWorkflowRuntimeForeground(target, summary.agent.agentId);
+    startForeground(target, token, workflowChildren);
     return;
   }
+  installWorkflowRuntime(target, summary.agent.agentId);
   installService(target);
   process.stdout.write(`${JSON.stringify({ ...summary, authenticated: true, started: true })}\n`);
 }
@@ -344,8 +789,15 @@ export {
   executionConfig,
   parseArgs,
   parseCapabilities,
+  parseWorkflowRuntimeMaxHeap,
+  parseWorkflowCredentialReferences,
   requireProductionApiBase,
+  resolveWorkflowRuntimeRelease,
   runtimeExecutable,
   safeId,
+  selectCapabilityPacksForAgent,
+  validateCapabilityPackReleases,
+  validateWorkflowReleaseDescriptor,
+  workflowRuntimeForegroundArguments,
   writeConfig,
 };

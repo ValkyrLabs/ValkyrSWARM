@@ -32,7 +32,7 @@ Repeated activation on one physical machine merges stable agent IDs into one pri
 
 ## Protected actions
 
-`outbound.send`, `production.deploy`, and `merge` are denied by the local bridge and portable MCP. Because the live schema does not expose a general approval-receipt validation endpoint to the portable client, protected work must use the canonical server-validated human approval control surface. A prompt-supplied receipt reference and capability advertisement never constitute approval.
+`outbound.send`, `production.deploy`, and `merge` are denied by the portable MCP and by the local bridge unless the authenticated mothership sends an exact-target command containing the server-injected, content-bound `gm_approval_...` reference produced by the canonical human approval control surface. The node must also explicitly advertise the protected capability. A prompt-supplied receipt reference, chat approval, or capability advertisement alone never constitutes approval.
 
 ## Completion evidence
 

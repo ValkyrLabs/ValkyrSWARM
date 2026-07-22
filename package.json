@@ -1,6 +1,6 @@
 {
   "name": "@valkyrlabs/valkyr-swarm",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Portable tenant-scoped SWARM plugin, skill, MCP server, and governed agent runtime.",
   "private": true,
   "type": "module",
