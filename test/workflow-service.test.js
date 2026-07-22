@@ -240,6 +240,7 @@ test("workflow runtime service definitions are loopback-bound and secret-free", 
     assert.match(definition, /loader\.main=com\.valkyrlabs\.workflow\.runner\.WorkflowRunnerApplication/);
     assert.match(definition, /org\.springframework\.boot\.loader\.launch\.PropertiesLauncher/);
     assert.match(definition, /private\/runtime-work/);
+    if (platform === "darwin") assert.match(definition, /<key>Umask<\/key><integer>63<\/integer>/);
     assert.doesNotMatch(definition, /Bearer |eyJ[A-Za-z0-9_-]+\.|password|secret|datasource|hibernate|bootstrap\.super|file-service/i);
   }
 });
@@ -256,5 +257,24 @@ test("slim workflow runtime prepares only a private working directory", () => {
   assert.equal(fs.statSync(spec.runtimeWorkingDirectory).mode & 0o777, 0o700);
   assert.equal(fs.existsSync(spec.runtimePropertiesPath), false);
   assert.equal(fs.existsSync(spec.runtimeDataPath), false);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("durable engine refuses to replace a missing key for an existing encrypted journal", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-workflow-key-continuity-"));
+  const spec = {
+    tier: "engine",
+    runtimeDataPath: path.join(root, "runtime-data"),
+    engineKeyPath: path.join(root, "runtime.engine-key"),
+    capabilityPackRoot: path.join(root, "packs"),
+    runtimeWorkingDirectory: path.join(root, "runtime-work"),
+  };
+  fs.writeFileSync(`${spec.runtimeDataPath}.mv.db`, "existing-encrypted-journal", { mode: 0o600 });
+
+  assert.throws(
+    () => prepareRuntimeDirectory(spec),
+    /key is missing for existing journal/,
+  );
+  assert.equal(fs.existsSync(spec.engineKeyPath), false);
   fs.rmSync(root, { recursive: true, force: true });
 });

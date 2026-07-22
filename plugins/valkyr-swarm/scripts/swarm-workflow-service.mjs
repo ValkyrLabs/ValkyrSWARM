@@ -358,6 +358,14 @@ function prepareRuntimeDirectory(spec) {
   if (spec.capabilityPackRoot) {
     fs.mkdirSync(spec.capabilityPackRoot, { recursive: true, mode: 0o700 });
   }
+  const journalFiles = [".mv.db", ".trace.db", ".lock.db"]
+    .map((suffix) => `${spec.runtimeDataPath}${suffix}`)
+    .filter((candidate) => fs.existsSync(candidate));
+  if (!fs.existsSync(spec.engineKeyPath) && journalFiles.length > 0) {
+    throw new Error(
+      `Workflow engine key is missing for existing journal ${journalFiles[0]}; restore the key or quarantine the journal before activation`,
+    );
+  }
   if (!fs.existsSync(spec.engineKeyPath)) {
     fs.writeFileSync(spec.engineKeyPath, `${crypto.randomBytes(32).toString("base64url")}\n`, {
       encoding: "utf8",
@@ -371,7 +379,7 @@ function prepareRuntimeDirectory(spec) {
 function serviceDefinition(spec) {
   const args = [spec.javaExecutable, ...runtimeArguments(spec)];
   if (spec.platform === "darwin") {
-    return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${xml(spec.label)}</string>\n  <key>ProgramArguments</key><array>\n${args.map((arg) => `    <string>${xml(arg)}</string>`).join("\n")}\n  </array>\n  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>WorkingDirectory</key><string>${xml(spec.runtimeWorkingDirectory)}</string>\n  <key>ThrottleInterval</key><integer>15</integer>\n  <key>StandardOutPath</key><string>${xml(spec.stdoutLog)}</string>\n  <key>StandardErrorPath</key><string>${xml(spec.stderrLog)}</string>\n</dict></plist>\n`;
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${xml(spec.label)}</string>\n  <key>ProgramArguments</key><array>\n${args.map((arg) => `    <string>${xml(arg)}</string>`).join("\n")}\n  </array>\n  <key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>Umask</key><integer>63</integer>\n  <key>WorkingDirectory</key><string>${xml(spec.runtimeWorkingDirectory)}</string>\n  <key>ThrottleInterval</key><integer>15</integer>\n  <key>StandardOutPath</key><string>${xml(spec.stdoutLog)}</string>\n  <key>StandardErrorPath</key><string>${xml(spec.stderrLog)}</string>\n</dict></plist>\n`;
   }
   if (spec.platform !== "linux") throw new Error("Workflow runtime supervision supports macOS and Linux");
   return `[Unit]\nDescription=Valkyr Workflow runtime (${spec.agentId})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nWorkingDirectory=${spec.runtimeWorkingDirectory}\nExecStart=${args.map(systemdArg).join(" ")}\nRestart=on-failure\nRestartSec=15\nStandardOutput=append:${spec.stdoutLog}\nStandardError=append:${spec.stderrLog}\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`;
