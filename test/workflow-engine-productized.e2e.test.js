@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -18,20 +19,30 @@ import {
 } from "../scripts/swarm-workflow-runtime.mjs";
 const artifact = process.env.VALKYR_WORKFLOW_ENGINE_E2E_ARTIFACT;
 const runnerArtifact = process.env.VALKYR_WORKFLOW_RUNNER_E2E_ARTIFACT;
+const openClawGtmPack = process.env.VALKYR_WORKFLOW_OPENCLAW_GTM_E2E_PACK;
 const workflowServiceScript = fileURLToPath(new URL("../scripts/swarm-workflow-service.mjs", import.meta.url));
 
 function sha256File(filePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
-function writeRuntimeConfig({ agentId, artifactPath, configPath, endpoint, root, tier }) {
+function writeRuntimeConfig({
+  agentId,
+  artifactPath,
+  capabilityPacks = [],
+  capabilities = ["graymatter.context"],
+  configPath,
+  endpoint,
+  root,
+  tier,
+}) {
   const engine = tier === "engine";
   const healthEndpoint = new URL(engine
     ? "/v1/swarm/workflow-engine/health"
     : "/v1/swarm/workflow-runs/health", endpoint).toString();
   const agent = {
     agentId,
-    capabilities: ["graymatter.context"],
+    capabilities,
     workflowRuntime: {
       enabled: true,
       tier,
@@ -49,6 +60,7 @@ function writeRuntimeConfig({ agentId, artifactPath, configPath, endpoint, root,
           ? path.join(process.env.JAVA_HOME, "bin", "java") : "java",
         jvmArgs: ["-Xms64m", engine ? "-Xmx384m" : "-Xmx256m"],
         arguments: ["--logging.level.root=WARN"],
+        capabilityPacks,
         runtimeDataPath: path.join(root, "journal", "workflow"),
         runtimeWorkingDirectory: path.join(root, "work"),
         engineKeyPath: path.join(root, "engine.key"),
@@ -59,14 +71,14 @@ function writeRuntimeConfig({ agentId, artifactPath, configPath, endpoint, root,
   return agent;
 }
 
-function startProductizedRuntime(configPath, agentId) {
+function startProductizedRuntime(configPath, agentId, environment = {}) {
   return spawn(process.execPath, [
     workflowServiceScript,
     "foreground",
     "--config", configPath,
     "--agent", agentId,
   ], {
-    env: { ...process.env },
+    env: { ...process.env, ...environment },
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
@@ -352,5 +364,241 @@ test("productized service invocation boots, advertises, and executes the durable
   const events = await fetch(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/events?after=0&limit=100`)
     .then((response) => response.json());
   assert.equal(events.events.some((event) => event.eventType === "SUCCESS"), true);
+  assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
+});
+
+test("productized durable engine suspends an outbound pack and resumes only with mothership approval", {
+  skip: !artifact || !openClawGtmPack,
+  timeout: 90_000,
+}, async (context) => {
+  const resolvedArtifact = path.resolve(artifact);
+  const resolvedPack = path.resolve(openClawGtmPack);
+  assert.equal(fs.existsSync(resolvedArtifact) && fs.statSync(resolvedArtifact).isFile(), true,
+    `Missing engine artifact: ${resolvedArtifact}`);
+  assert.equal(fs.existsSync(resolvedPack) && fs.statSync(resolvedPack).isFile(), true,
+    `Missing OpenClaw GTM pack: ${resolvedPack}`);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-engine-approval-e2e-"));
+  const agentId = "codex-engine-approval-e2e";
+  const port = await availablePort();
+  const configPath = path.join(root, "agent.json");
+  const packSha = sha256File(resolvedPack);
+  const capabilityPack = {
+    id: "openclaw-gtm",
+    version: "2.0.0",
+    artifactUrl: "https://downloads.example.test/openclaw-gtm.jar",
+    sha256: packSha,
+    requiredNodeCapabilities: ["openclaw.skill.execute", "outbound.send"],
+  };
+  const packInstallPath = path.join(
+    root,
+    ".local",
+    "share",
+    "valkyr-swarm",
+    "workflow-runtimes",
+    `${agentId}-packs`,
+    `openclaw-gtm-${packSha}.jar`,
+  );
+  fs.mkdirSync(path.dirname(packInstallPath), { recursive: true, mode: 0o700 });
+  fs.copyFileSync(resolvedPack, packInstallPath);
+  fs.chmodSync(packInstallPath, 0o600);
+
+  const agent = writeRuntimeConfig({
+    agentId,
+    artifactPath: resolvedArtifact,
+    capabilityPacks: [capabilityPack],
+    capabilities: ["graymatter.context", "openclaw.skill.execute", "outbound.send"],
+    configPath,
+    endpoint: new URL(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/execute`),
+    root,
+    tier: "engine",
+  });
+
+  const openClawRequests = [];
+  const openClawServer = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    openClawRequests.push({
+      method: request.method,
+      path: request.url,
+      body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      result: "loopback acceptance only",
+      receiptRef: "acceptance:openclaw-gtm:1",
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    openClawServer.once("error", reject);
+    openClawServer.listen(0, "127.0.0.1", resolve);
+  });
+  const openClawAddress = openClawServer.address();
+  const openClawEndpoint =
+    `http://127.0.0.1:${openClawAddress.port}/api/skills/execute`;
+
+  const child = startProductizedRuntime(configPath, agent.agentId, { HOME: root });
+  let runtimeLog = "";
+  child.stdout.on("data", (chunk) => { runtimeLog += chunk.toString(); });
+  child.stderr.on("data", (chunk) => { runtimeLog += chunk.toString(); });
+  context.after(async () => {
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([
+        new Promise((resolve) => child.once("exit", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 3_000)),
+      ]);
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }
+    await new Promise((resolve) => openClawServer.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const healthUrl = `http://127.0.0.1:${port}/v1/swarm/workflow-engine/health`;
+  const health = await waitForHealth(healthUrl, child);
+  const moduleClass =
+    "com.valkyrlabs.workflow.modules.openclaw.OpenClawOutboundGtmModule";
+  const moduleHash = health.moduleAbiHashes?.[moduleClass];
+  assert.match(moduleHash ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(
+    health.capabilityPacks?.some((pack) => pack.id === "openclaw-gtm"),
+    true,
+  );
+
+  const workflowVersionId = "1b92dcfb-48ef-4dc4-9583-86f851900ad1";
+  const workflowExecutionId = "2b92dcfb-48ef-4dc4-9583-86f851900ad2";
+  const workflowRunnerId = "3b92dcfb-48ef-4dc4-9583-86f851900ad3";
+  const moduleId = "4b92dcfb-48ef-4dc4-9583-86f851900ad4";
+  const graph = {
+    workflow: { id: "5b92dcfb-48ef-4dc4-9583-86f851900ad5", name: "Approval E2E" },
+    nodes: [
+      { nodeId: "start", type: "start", label: "Start" },
+      {
+        nodeId: "outbound",
+        taskId: "6b92dcfb-48ef-4dc4-9583-86f851900ad6",
+        type: "task",
+        label: "Outbound acceptance",
+      },
+      { nodeId: "end", type: "end", label: "End" },
+    ],
+    edges: [
+      { edgeId: "start-outbound", source: "start", target: "outbound" },
+      { edgeId: "outbound-end", source: "outbound", target: "end" },
+    ],
+    modules: [{
+      moduleId,
+      nodeId: "outbound",
+      className: moduleClass,
+      name: "Outbound acceptance",
+      execModuleConfig: {
+        payloadConfig: {
+          parameters: JSON.stringify({
+            operation: "outreach.send",
+            endpointUrl: openClawEndpoint,
+            timeoutMs: 5_000,
+          }),
+        },
+      },
+    }],
+  };
+  const definitionSnapshot = JSON.stringify({ schemaVersion: 1, submittedGraph: graph });
+  const definitionSnapshotHash = crypto.createHash("sha256").update(definitionSnapshot).digest("hex");
+  const logicalIdempotencyKey = `swarm-engine-approval-e2e:${definitionSnapshotHash}`;
+  const callbacks = {
+    heartbeat: `/v1/vaiworkflow/engine/executions/${workflowExecutionId}/heartbeat/${workflowRunnerId}/7`,
+    materialize: `/v1/vaiworkflow/engine/executions/${workflowExecutionId}/materialize/${workflowRunnerId}/7`,
+    complete: "/v1/vaiworkflow/engine/executions/complete",
+  };
+  const materialization = {
+    protocol: "valkyr-workflow-engine/v1",
+    workflowExecutionId,
+    workflowRunnerId,
+    leaseFence: 7,
+    logicalIdempotencyKey,
+    workflowVersionId,
+    definitionSnapshotHash,
+    abiHash: "d".repeat(64),
+    definitionSnapshot,
+    initialState: {
+      input: { audience: "acceptance-only" },
+      context: { source: "bounded-productized-e2e" },
+      idempotencyKey: "bounded-productized-e2e",
+    },
+    moduleAbiHashes: { [moduleClass]: moduleHash },
+    approvals: {},
+  };
+  const completions = [];
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith(callbacks.heartbeat)) return new Response(null, { status: 204 });
+    if (value.endsWith(callbacks.materialize)) {
+      return new Response(JSON.stringify(materialization), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.endsWith(callbacks.complete)) {
+      completions.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ accepted: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return fetch(url, options);
+  };
+  const execute = (commandId) => executeWorkflowRuntimeCommand({
+    agent,
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "private-test-session",
+    fetchImpl,
+    wire: {
+      action: WORKFLOW_ENGINE_ACTION,
+      commandId,
+      trace: { traceId: commandId },
+      command: {
+        scope: {},
+        payload: {
+          workflowExecutionId,
+          workflowRunnerId,
+          leaseFence: 7,
+          logicalIdempotencyKey,
+          workflowVersionId,
+          definitionSnapshotHash,
+          callbacks,
+        },
+      },
+    },
+  });
+
+  const waiting = await execute("engine-approval-waiting-e2e");
+  assert.equal(waiting.executed, true);
+  assert.equal(completions.at(-1).terminalState, "WAITING_APPROVAL");
+  assert.match(
+    completions.at(-1).checkpointRef,
+    new RegExp(`:approval:${moduleId}$`),
+  );
+  assert.equal(openClawRequests.length, 0);
+
+  materialization.approvals = {
+    [moduleId]: {
+      approvalRef: "workflow-approval:7b92dcfb-48ef-4dc4-9583-86f851900ad7",
+      approved: true,
+    },
+  };
+  const resumed = await execute("engine-approval-resume-e2e");
+  assert.equal(resumed.executed, true);
+  assert.equal(completions.at(-1).terminalState, "SUCCESS");
+  assert.equal(openClawRequests.length, 1);
+  assert.deepEqual(openClawRequests[0], {
+    method: "POST",
+    path: "/api/skills/execute",
+    body: {
+      skill: "outreach-send",
+      operation: "outreach.send",
+      input: { audience: "acceptance-only" },
+      context: { source: "bounded-productized-e2e" },
+      idempotencyKey: "bounded-productized-e2e",
+    },
+  });
   assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
 });
