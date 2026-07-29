@@ -35,7 +35,7 @@ import {
 
 const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
 const DEFAULT_DURATION_SECONDS = 72 * 60 * 60;
-const PACKAGE_VERSION = "0.4.0";
+const PACKAGE_VERSION = "0.4.1";
 const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
 const MAX_IDENTIFIER_LENGTH = 160;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
