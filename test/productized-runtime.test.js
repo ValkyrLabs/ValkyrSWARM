@@ -12,6 +12,7 @@ import {
   resolveWorkflowRuntimeRelease,
   selectCapabilityPacksForAgent,
   validateWorkflowReleaseDescriptor,
+  workflowReleaseDiscoveryTimeoutMs,
   workflowRuntimeForegroundArguments,
   writeConfig,
 } from "../scripts/swarm-activate.mjs";
@@ -42,6 +43,30 @@ function fakeSpawn(stdoutText, stderrText = "", exitCode = 0) {
     return child;
   };
 }
+
+test("Workflow release discovery timeout is bounded and tolerant of a loaded mothership", () => {
+  assert.equal(workflowReleaseDiscoveryTimeoutMs({}), 120_000);
+  assert.equal(
+    workflowReleaseDiscoveryTimeoutMs({
+      VALKYR_SWARM_RELEASE_DISCOVERY_TIMEOUT_SECONDS: "45",
+    }),
+    45_000,
+  );
+  assert.throws(
+    () =>
+      workflowReleaseDiscoveryTimeoutMs({
+        VALKYR_SWARM_RELEASE_DISCOVERY_TIMEOUT_SECONDS: "29",
+      }),
+    /must be an integer from 30 to 300/,
+  );
+  assert.throws(
+    () =>
+      workflowReleaseDiscoveryTimeoutMs({
+        VALKYR_SWARM_RELEASE_DISCOVERY_TIMEOUT_SECONDS: "301",
+      }),
+    /must be an integer from 30 to 300/,
+  );
+});
 
 test("normal activation is production-only and auto-enables executable runtimes", () => {
   assert.throws(

@@ -26,6 +26,7 @@ const WORKFLOW_SERVICE_SCRIPT = path.join(SCRIPT_DIR, "swarm-workflow-service.mj
 const WORKFLOW_RELEASE_PROTOCOL = "valkyr-workflow-runtime-release/v1";
 const WORKFLOW_RUNNER_PROTOCOL = "valkyr-workflow-runner/v1";
 const WORKFLOW_ENGINE_PROTOCOL = "valkyr-workflow-engine/v1";
+const DEFAULT_WORKFLOW_RELEASE_DISCOVERY_TIMEOUT_SECONDS = 120;
 
 const DEFAULT_CAPABILITIES = {
   "claude-code": ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workflow.remediate", "workspace.files.read"],
@@ -251,6 +252,20 @@ function requireProductionApiBase(apiBase, testMode = false) {
   if (apiBase !== DEFAULT_API_BASE && !testMode) {
     throw new Error(`Durable SWARM activation must use ${DEFAULT_API_BASE}; use --test-mode only for isolated tests`);
   }
+}
+
+function workflowReleaseDiscoveryTimeoutMs(env = process.env) {
+  const raw = env.VALKYR_SWARM_RELEASE_DISCOVERY_TIMEOUT_SECONDS;
+  if (raw === undefined || String(raw).trim() === "") {
+    return DEFAULT_WORKFLOW_RELEASE_DISCOVERY_TIMEOUT_SECONDS * 1000;
+  }
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds < 30 || seconds > 300) {
+    throw new Error(
+      "VALKYR_SWARM_RELEASE_DISCOVERY_TIMEOUT_SECONDS must be an integer from 30 to 300",
+    );
+  }
+  return seconds * 1000;
 }
 
 function defaultReceiptLog(machineId) {
@@ -605,7 +620,7 @@ async function resolveWorkflowRuntimeRelease(target, token, fetchImpl = fetch) {
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
       },
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(workflowReleaseDiscoveryTimeoutMs()),
     });
     if (!response.ok) {
       throw new Error(`Workflow ${tier} release discovery failed with HTTP ${response.status}`);
@@ -806,6 +821,7 @@ export {
   selectCapabilityPacksForAgent,
   validateCapabilityPackReleases,
   validateWorkflowReleaseDescriptor,
+  workflowReleaseDiscoveryTimeoutMs,
   workflowRuntimeForegroundArguments,
   writeConfig,
 };
