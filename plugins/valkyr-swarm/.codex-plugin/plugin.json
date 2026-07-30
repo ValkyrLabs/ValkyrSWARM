@@ -1,6 +1,6 @@
 {
   "name": "valkyr-swarm",
-  "version": "0.4.2+codex.20260729043000",
+  "version": "0.4.3+codex.20260729204100",
   "description": "Activate and operate executable production tenant SWARM agents with realtime websocket and GrayMatter receipts.",
   "author": {
     "name": "Valkyr Labs Inc.",

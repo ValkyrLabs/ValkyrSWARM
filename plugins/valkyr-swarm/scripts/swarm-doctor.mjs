@@ -16,7 +16,7 @@ import { validateConfig } from "./swarm-agent.mjs";
 import { probeWorkflowRuntime } from "./swarm-workflow-runtime.mjs";
 import { ValkyrSwarmClient } from "../mcp-server/index.js";
 
-const VERSION = "0.4.2";
+const VERSION = "0.4.3";
 const FORBIDDEN_CONFIG_KEYS = new Set([
   "authorization", "bearertoken", "jwt", "ownerid", "organizationid",
   "password", "secret", "tenantid", "token", "username",

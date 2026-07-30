@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,8 +10,15 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
-const AGENT_SCRIPT = path.join(SCRIPT_DIR, "swarm-agent.mjs");
 const LABEL_PREFIX = "com.valkyrlabs.swarm";
+const SERVICE_RUNTIME_FILES = Object.freeze([
+  "swarm-agent.mjs",
+  "swarm-auth.mjs",
+  "swarm-graymatter.mjs",
+  "swarm-runtime-adapters.mjs",
+  "swarm-service-lifecycle.mjs",
+  "swarm-workflow-runtime.mjs",
+]);
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
@@ -99,6 +107,88 @@ function loadConfig(configPath) {
   return { config, configPath: resolved };
 }
 
+function serviceRuntimeDigest(runtimeRoot = SCRIPT_DIR) {
+  const digest = createHash("sha256");
+  for (const name of SERVICE_RUNTIME_FILES) {
+    const source = path.join(runtimeRoot, name);
+    const stat = fs.lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`SWARM service runtime file is not a regular file: ${name}`);
+    }
+    digest.update(name);
+    digest.update("\0");
+    digest.update(fs.readFileSync(source));
+    digest.update("\0");
+  }
+  return digest.digest("hex");
+}
+
+function serviceRuntimeBinding(homedir = os.homedir()) {
+  const digest = serviceRuntimeDigest();
+  const runtimeRoot = path.join(
+    homedir,
+    ".local",
+    "share",
+    "valkyr-swarm",
+    "service-runtimes",
+    digest,
+  );
+  return {
+    agentScript: path.join(runtimeRoot, "swarm-agent.mjs"),
+    digest,
+    runtimeRoot,
+  };
+}
+
+function verifyInstalledServiceRuntime(runtimeRoot, expectedDigest) {
+  const stat = fs.lstatSync(runtimeRoot);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("Installed SWARM service runtime is not a private directory");
+  }
+  if (serviceRuntimeDigest(runtimeRoot) !== expectedDigest) {
+    throw new Error("Installed SWARM service runtime failed content verification");
+  }
+}
+
+function stageServiceRuntime(spec, sourceRoot = SCRIPT_DIR) {
+  const expectedDigest = serviceRuntimeDigest(sourceRoot);
+  if (expectedDigest !== spec.serviceRuntimeDigest) {
+    throw new Error("SWARM service runtime source changed after service specification");
+  }
+  if (fs.existsSync(spec.serviceRuntimeRoot)) {
+    verifyInstalledServiceRuntime(spec.serviceRuntimeRoot, expectedDigest);
+    return spec.serviceRuntimeRoot;
+  }
+
+  const parent = path.dirname(spec.serviceRuntimeRoot);
+  const temporary = `${spec.serviceRuntimeRoot}.tmp-${process.pid}-${Date.now()}`;
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(temporary, { recursive: false, mode: 0o700 });
+  try {
+    for (const name of SERVICE_RUNTIME_FILES) {
+      const destination = path.join(temporary, name);
+      fs.copyFileSync(path.join(sourceRoot, name), destination);
+      fs.chmodSync(destination, 0o600);
+    }
+    if (serviceRuntimeDigest(temporary) !== expectedDigest) {
+      throw new Error("Staged SWARM service runtime failed content verification");
+    }
+    try {
+      fs.renameSync(temporary, spec.serviceRuntimeRoot);
+    } catch (error) {
+      if (!["EEXIST", "ENOTEMPTY"].includes(error?.code)) {
+        throw error;
+      }
+      verifyInstalledServiceRuntime(spec.serviceRuntimeRoot, expectedDigest);
+    }
+    verifyInstalledServiceRuntime(spec.serviceRuntimeRoot, expectedDigest);
+    fs.chmodSync(spec.serviceRuntimeRoot, 0o700);
+    return spec.serviceRuntimeRoot;
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
 function serviceSpec(options, loaded, platform = process.platform) {
   const machineId = safeToken(loaded.config.machineId, "machineId");
   const label = safeToken(options.label ?? `${LABEL_PREFIX}.${machineId}`, "service label");
@@ -132,7 +222,9 @@ function serviceSpec(options, loaded, platform = process.platform) {
     "/usr/sbin",
     "/sbin",
   ])].join(":");
+  const serviceRuntime = serviceRuntimeBinding();
   return {
+    agentScript: serviceRuntime.agentScript,
     configPath: loaded.configPath,
     credentialFile,
     keychainService,
@@ -141,6 +233,8 @@ function serviceSpec(options, loaded, platform = process.platform) {
     platform,
     receiptLog,
     runtimePath,
+    serviceRuntimeDigest: serviceRuntime.digest,
+    serviceRuntimeRoot: serviceRuntime.runtimeRoot,
     serverUrl,
     servicePath,
     stderrLog,
@@ -152,7 +246,7 @@ function serviceSpec(options, loaded, platform = process.platform) {
 function agentArguments(spec) {
   return [
     process.execPath,
-    AGENT_SCRIPT,
+    spec.agentScript,
     "--config", spec.configPath,
     "--receipt-log", spec.receiptLog,
     "--url", spec.serverUrl,
@@ -175,7 +269,7 @@ function plist(spec) {
     <key>ProgramArguments</key><array>
 ${argumentsXml}
     </array>
-    <key>WorkingDirectory</key><string>${xml(REPO_ROOT)}</string>
+    <key>WorkingDirectory</key><string>${xml(spec.serviceRuntimeRoot)}</string>
     <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(spec.runtimePath)}</string></dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -196,7 +290,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${systemdArg(REPO_ROOT)}
+WorkingDirectory=${systemdArg(spec.serviceRuntimeRoot)}
 Environment=${systemdArg(`PATH=${spec.runtimePath}`)}
 ExecStart=${agentArguments(spec).map(systemdArg).join(" ")}
 SyslogIdentifier=${spec.label}
@@ -235,6 +329,7 @@ function launchTarget(spec) {
 }
 
 function install(spec) {
+  stageServiceRuntime(spec);
   fs.mkdirSync(path.dirname(spec.servicePath), { recursive: true, mode: 0o700 });
   for (const logPath of [spec.receiptLog, spec.stdoutLog, spec.stderrLog]) {
     fs.mkdirSync(path.dirname(logPath), { recursive: true, mode: 0o700 });
@@ -294,8 +389,11 @@ function selfTest() {
   for (const platform of ["darwin", "linux"]) {
     const spec = serviceSpec({}, loaded, platform);
     const content = serviceDefinition(spec);
-    for (const required of [spec.label, process.execPath, path.dirname(process.execPath), AGENT_SCRIPT, "--continuous", "--token-file", "--credential-file", "VALKYR_AUTH", "PATH"]) {
+    for (const required of [spec.label, process.execPath, path.dirname(process.execPath), spec.agentScript, spec.serviceRuntimeRoot, "--continuous", "--token-file", "--credential-file", "VALKYR_AUTH", "PATH"]) {
       if (!content.includes(required)) throw new Error(`${platform} service is missing ${required}`);
+    }
+    if (content.includes(REPO_ROOT) || content.includes(path.join(SCRIPT_DIR, "swarm-agent.mjs"))) {
+      throw new Error(`${platform} service depends on the mutable plugin or checkout path`);
     }
     if (/Bearer |eyJ[A-Za-z0-9_-]+\.|API0_JWT_SESSION|VALKYR_AUTH_TOKEN|VALKYR_PASSWORD/.test(content)) {
       throw new Error(`${platform} service contains credential material`);
@@ -344,4 +442,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
 }
 
-export { parseArgs, plist, serviceDefinition, serviceSpec, systemdUnit };
+export {
+  SERVICE_RUNTIME_FILES,
+  parseArgs,
+  plist,
+  serviceDefinition,
+  serviceRuntimeDigest,
+  serviceSpec,
+  stageServiceRuntime,
+  systemdUnit,
+};
