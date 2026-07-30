@@ -29,7 +29,22 @@ test("runtime persists a bounded tenant-derived GrayMatter terminal receipt", as
     wire: {
       action: "workflow.debug",
       commandId: "cmd-1",
-      trace: { traceId: "trace-1" },
+      receiptRef: "swarm-command:cmd-1",
+      trace: {
+        traceId: "trace-1",
+        contextPageRef: "context-page-1",
+        skillOptReceiptRef: "skillopt-route-1",
+        workflowExecutionRef: "workflow-execution-1",
+        capabilityGrantRef: "capability-grant-1",
+      },
+      command: {
+        retrievalReceiptRef: "retrieval-receipt-1",
+        trajectoryRef: "trajectory-1",
+        policyReceiptRef: "policy-receipt-1",
+        bifrostChainRef: "bifrost-chain-1",
+        bifrostChainHash: `sha256:${"a".repeat(64)}`,
+        bifrostComplete: true,
+      },
     },
     response: {
       type: "ACK",
@@ -42,7 +57,19 @@ test("runtime persists a bounded tenant-derived GrayMatter terminal receipt", as
   assert.equal(captured.url, "https://api-0.valkyrlabs.com/v1/MemoryEntry/write");
   assert.equal(captured.body.sourceChannel, "valkyr-swarm:receipts");
   assert.equal(captured.body.sourceMessageId, "swarm-command:cmd-1:completed");
-  assert.equal(JSON.parse(captured.body.text).protectedAction, false);
+  const receipt = JSON.parse(captured.body.text);
+  assert.equal(receipt.protectedAction, false);
+  assert.equal(receipt.contextPageRef, "context-page-1");
+  assert.equal(receipt.retrievalReceiptRef, "retrieval-receipt-1");
+  assert.equal(receipt.trajectoryRef, "trajectory-1");
+  assert.equal(receipt.skillOptReceiptRef, "skillopt-route-1");
+  assert.equal(receipt.workflowExecutionRef, "workflow-execution-1");
+  assert.equal(receipt.capabilityGrantRef, "capability-grant-1");
+  assert.equal(receipt.policyReceiptRef, "policy-receipt-1");
+  assert.equal(receipt.bifrostChainRef, "bifrost-chain-1");
+  assert.equal(receipt.bifrostChainHash, `sha256:${"a".repeat(64)}`);
+  assert.equal(receipt.bifrostComplete, true);
+  assert.equal(receipt.swarmReceiptRef, "swarm-command:cmd-1");
   assert.match(captured.headers.Authorization, /^Bearer /);
 });
 
@@ -128,6 +155,25 @@ test("command receipt text is deterministic in shape and bounded", () => {
   const parsed = JSON.parse(text);
   assert.equal(parsed.schemaVersion, "valkyr-swarm-command-receipt/0.1");
   assert.equal(parsed.status, "failed");
+});
+
+test("command receipt lineage drops token-shaped values instead of persisting them as refs", () => {
+  const token = "eyJabcdefgh.ijklmnop.qrstuvwx";
+  const text = commandReceiptText({
+    agent: { agentId: "agent-1", runtime: "openclaw" },
+    wire: {
+      commandId: "cmd-secret-ref",
+      action: "task.write",
+      trace: {
+        traceId: "trace-secret-ref",
+        skillOptReceiptRef: token,
+      },
+    },
+    response: { type: "ACK", status: "completed", result: { executed: true } },
+  });
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.skillOptReceiptRef, null);
+  assert.equal(text.includes(token), false);
 });
 
 test("protected command receipts retain the canonical approval binding", () => {

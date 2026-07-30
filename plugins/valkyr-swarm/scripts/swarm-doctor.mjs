@@ -16,12 +16,16 @@ import { validateConfig } from "./swarm-agent.mjs";
 import { probeWorkflowRuntime } from "./swarm-workflow-runtime.mjs";
 import { ValkyrSwarmClient } from "../mcp-server/index.js";
 
-const VERSION = "0.4.1";
+const VERSION = "0.4.2";
 const FORBIDDEN_CONFIG_KEYS = new Set([
   "authorization", "bearertoken", "jwt", "ownerid", "organizationid",
   "password", "secret", "tenantid", "token", "username",
 ]);
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/;
+const WORKFLOW_TIER_TOOLS = Object.freeze({
+  runner: "workflow.runner.execute-module",
+  engine: "workflow.engine.execute-workflow",
+});
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
@@ -189,6 +193,86 @@ function check(name, status, details = {}) {
   return { name, status, ...details };
 }
 
+function safeStringList(value, maximum = 64) {
+  return Array.isArray(value)
+    ? [...new Set(value
+      .map((item) => String(item ?? "").trim())
+      .filter((item) => item && item.length <= 160))]
+      .slice(0, maximum)
+    : [];
+}
+
+function expectedWorkflowTool(agent) {
+  if (agent?.workflowRuntime?.enabled === false || !agent?.workflowRuntime) return null;
+  const tier = agent.workflowRuntime.tier === "engine" ? "engine" : "runner";
+  return WORKFLOW_TIER_TOOLS[tier];
+}
+
+/**
+ * Bounded proof of what the authenticated mothership registry received.
+ * ExecModule ABI hashes stay summarized; the exact Workflow tier, capability
+ * packs, and manifest hash remain visible for activation acceptance.
+ */
+function registeredAgentEvidence(agents, registry) {
+  const safeRegistry = registry && typeof registry === "object" ? registry : {};
+  return agents.map((agent) => {
+    const current = safeRegistry[agent.agentId];
+    const supportedTools = safeStringList(current?.supportedTools, 16);
+    const capabilities = safeStringList(current?.capabilities, 256);
+    const expectedTool = expectedWorkflowTool(agent);
+    const runtime = current?.workflowRuntime && typeof current.workflowRuntime === "object"
+      ? current.workflowRuntime : null;
+    const digest = String(runtime?.capabilityPackManifestHash ?? "").toLowerCase();
+    const workflowRuntime = runtime ? {
+      installed: runtime.installed === true,
+      healthy: runtime.healthy === true,
+      status: String(runtime.status ?? ""),
+      version: runtime.version == null ? null : String(runtime.version).slice(0, 128),
+      protocol: runtime.protocol == null ? null : String(runtime.protocol).slice(0, 128),
+      moduleAbiCount: Number.isSafeInteger(Number(runtime.moduleAbiCount))
+        ? Number(runtime.moduleAbiCount) : null,
+      capabilityPackCount: Number.isSafeInteger(Number(runtime.capabilityPackCount))
+        ? Number(runtime.capabilityPackCount) : null,
+      capabilityPackManifestHash: /^[a-f0-9]{64}$/.test(digest) ? digest : null,
+      capabilityPacks: capabilities
+        .filter((capability) => capability.startsWith("workflow-pack:"))
+        .slice(0, 32),
+    } : null;
+    const workflowCapabilityAdvertised = expectedTool == null ? null
+      : Boolean(current)
+        && current.status === "healthy"
+        && supportedTools.includes(expectedTool)
+        && workflowRuntime?.installed === true
+        && workflowRuntime?.healthy === true;
+    return {
+      agentId: agent.agentId,
+      present: Boolean(current),
+      status: current?.status ?? null,
+      runtime: current?.runtime ?? null,
+      lastSeen: current?.lastSeen ?? current?.lastHeartbeat ?? null,
+      supportedTools,
+      expectedWorkflowTool: expectedTool,
+      workflowCapabilityAdvertised,
+      workflowRuntime,
+    };
+  });
+}
+
+function tenantWorkflowCapabilityEvidence(registered) {
+  const required = registered.filter((agent) => agent.expectedWorkflowTool);
+  return {
+    requiredAgents: required.length,
+    ready: required.every((agent) => agent.workflowCapabilityAdvertised === true),
+    registered: required.map((agent) => ({
+      agentId: agent.agentId,
+      expectedWorkflowTool: agent.expectedWorkflowTool,
+      supportedTools: agent.supportedTools,
+      workflowCapabilityAdvertised: agent.workflowCapabilityAdvertised,
+      workflowRuntime: agent.workflowRuntime,
+    })),
+  };
+}
+
 async function diagnose(options = {}) {
   const paths = defaultPaths(options);
   const checks = [];
@@ -271,16 +355,18 @@ async function diagnose(options = {}) {
       const client = new ValkyrSwarmClient({ env: { ...process.env, VALKYR_API_BASE: config.serverUrl } });
       const snapshot = await client.agentsSnapshot();
       const registry = snapshot?.registry && typeof snapshot.registry === "object" ? snapshot.registry : {};
-      const registered = agents.map((agent) => ({
-        agentId: agent.agentId,
-        present: Boolean(registry[agent.agentId]),
-        status: registry[agent.agentId]?.status ?? null,
-        runtime: registry[agent.agentId]?.runtime ?? null,
-        lastSeen: registry[agent.agentId]?.lastSeen ?? registry[agent.agentId]?.lastHeartbeat ?? null,
-      }));
+      const registered = registeredAgentEvidence(agents, registry);
       live = { agentCount: Object.keys(registry).length, registered };
       const healthy = registered.length > 0 && registered.every((agent) => agent.present && agent.status === "healthy");
       checks.push(check("tenant_registry", healthy ? "pass" : "fail", live));
+      const workflowCapabilities = tenantWorkflowCapabilityEvidence(registered);
+      if (workflowCapabilities.requiredAgents > 0) {
+        checks.push(check(
+          "tenant_workflow_capabilities",
+          workflowCapabilities.ready ? "pass" : "fail",
+          workflowCapabilities,
+        ));
+      }
     } catch (error) {
       checks.push(check("tenant_registry", "fail", { reason: error instanceof Error ? error.message : String(error) }));
     }
@@ -327,4 +413,16 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   });
 }
 
-export { defaultPaths, defaultReceiptLog, diagnose, forbiddenConfigPaths, parseArgs, readReceiptEvidence, safeId, serviceState, workflowRuntimeServiceState };
+export {
+  defaultPaths,
+  defaultReceiptLog,
+  diagnose,
+  forbiddenConfigPaths,
+  parseArgs,
+  readReceiptEvidence,
+  registeredAgentEvidence,
+  safeId,
+  serviceState,
+  tenantWorkflowCapabilityEvidence,
+  workflowRuntimeServiceState,
+};

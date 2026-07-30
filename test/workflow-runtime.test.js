@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   WORKFLOW_ENGINE_ACTION,
+  WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION,
   WORKFLOW_ENGINE_KILL_ACTION,
   WORKFLOW_RUNNER_ACTION,
   executeWorkflowRuntimeCommand,
@@ -10,6 +11,7 @@ import {
   loopbackUrl,
   probeWorkflowRuntime,
   workflowRunnerMetadata,
+  workflowRuntimeTransportFailure,
 } from "../scripts/swarm-workflow-runtime.mjs";
 
 const agent = {
@@ -26,6 +28,17 @@ const agent = {
     trustScore: 0.95,
   },
 };
+
+test("workflow runtime transport diagnostics are bounded and secret-safe", () => {
+  const jwt = "eyJabcdefghijk.eyJabcdefghijk.eyJabcdefghijk";
+  const failure = workflowRuntimeTransportFailure(
+    new Error(`HTTP 500 Authorization: Bearer ${jwt} token=private-value`),
+  );
+
+  assert.match(failure, /^Local Workflow runtime transport failed: HTTP 500/);
+  assert.doesNotMatch(failure, /private-value|eyJabcdefghijk/);
+  assert.ok(failure.length <= 540);
+});
 
 test("durable workflow engine capability is independently health-gated", async () => {
   const engineAgent = {
@@ -184,6 +197,71 @@ test("durable workflow engine kill command reaches only the loopback kill switch
   assert.equal(calls[0].options.headers["X-Valkyr-Swarm-Command-Id"], "kill-command-1");
 });
 
+test("durable workflow approval denial reaches the exact loopback checkpoint", async () => {
+  const engineAgent = {
+    ...agent,
+    workflowRuntime: {
+      ...agent.workflowRuntime,
+      tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health",
+    },
+  };
+  const calls = [];
+  const payload = {
+    workflowExecutionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    workflowRunnerId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    workflowVersionId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+    definitionSnapshotHash: "d".repeat(64),
+    leaseFence: 11,
+    checkpointId: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+    approvalId: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+    continuationIntentId: "11111111-1111-1111-1111-111111111111",
+    decisionStatus: "DENIED",
+    completionDigest: "2".repeat(64),
+    denialMode: "SKIP_TO_TASK",
+    denialResumeTaskId: "33333333-3333-3333-3333-333333333333",
+    remoteCheckpointRef:
+      "engine-checkpoint:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:approval:module-1",
+  };
+  const result = await executeWorkflowRuntimeCommand({
+    agent: engineAgent,
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "unused",
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      return new Response(JSON.stringify({
+        success: true,
+        terminalState: "SUCCESS",
+        finalState: { workflowApprovalDenied: true },
+        checkpointRef: payload.remoteCheckpointRef,
+      }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    },
+    wire: {
+      action: WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION,
+      commandId: "deny-command-1",
+      command: { payload },
+    },
+  });
+
+  assert.equal(result.status, "approval_denial_applied");
+  assert.equal(result.terminalState, "SUCCESS");
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    "http://127.0.0.1:8767/v1/swarm/workflow-engine/executions/"
+      + "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/approval-denied",
+  );
+  assert.equal(
+    calls[0].options.headers["X-Valkyr-Swarm-Command-Id"],
+    "deny-command-1",
+  );
+  assert.deepEqual(JSON.parse(calls[0].options.body), payload);
+});
+
 test("durable engine replays local progress and terminal callbacks after the command request returns", async () => {
   const engineAgent = {
     ...agent,
@@ -271,6 +349,145 @@ test("durable engine replays local progress and terminal callbacks after the com
   assert.equal(completion.options.headers.Authorization, "Bearer session-token");
   const acknowledgement = calls.find((call) => call.url.endsWith("/events/ack"));
   assert.deepEqual(JSON.parse(acknowledgement.options.body), { through: 2 });
+});
+
+test("durable engine acknowledges only explicitly non-retryable fenced journal events", async () => {
+  const engineAgent = {
+    ...agent,
+    workflowRuntime: {
+      ...agent.workflowRuntime,
+      tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health",
+    },
+  };
+  const calls = [];
+  const discarded = [];
+  const callbacks = {
+    heartbeat: "/v1/vaiworkflow/engine/executions/execution-stale/heartbeat/runner-old/3",
+    complete: "/v1/vaiworkflow/engine/executions/complete",
+    progress: "/v1/vaiworkflow/engine/executions/execution-stale/progress",
+  };
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    calls.push({ url: value, options });
+    if (value.endsWith("/events/ack")) {
+      return new Response(JSON.stringify({
+        acknowledged: JSON.parse(options.body).through,
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.includes("127.0.0.1:8767/v1/swarm/workflow-engine/events")) {
+      return new Response(JSON.stringify({
+        acknowledged: 0,
+        events: [{
+          id: 1,
+          executionId: "execution-stale",
+          eventType: "TASK_STARTED",
+          workflowRunnerId: "runner-old",
+          workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+          definitionSnapshotHash: "d".repeat(64),
+          leaseFence: 3,
+          callbacks,
+          payload: { taskId: "obsolete" },
+        }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.endsWith("/execution-stale/progress")) {
+      return new Response(JSON.stringify({
+        error: "Workflow Engine Callback Fenced",
+        code: "WORKFLOW_ENGINE_CALLBACK_RUNNER_NOT_OWNER",
+        retryable: false,
+      }), {
+        status: 409,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected request: ${value}`);
+  };
+
+  const replay = await forwardWorkflowEngineEventsOnce({
+    agent: engineAgent,
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "session-token",
+    fetchImpl,
+    onDiscarded: async (event) => discarded.push(event),
+  });
+
+  assert.equal(replay.next, 1);
+  assert.equal(replay.activeExecutions.size, 0);
+  assert.equal(discarded.length, 1);
+  assert.equal(
+    discarded[0].error.code,
+    "WORKFLOW_ENGINE_CALLBACK_RUNNER_NOT_OWNER",
+  );
+  const acknowledgement = calls.find((call) => call.url.endsWith("/events/ack"));
+  assert.deepEqual(JSON.parse(acknowledgement.options.body), { through: 1 });
+});
+
+test("durable engine never acknowledges ordinary authorization failures", async () => {
+  const engineAgent = {
+    ...agent,
+    workflowRuntime: {
+      ...agent.workflowRuntime,
+      tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health",
+    },
+  };
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    calls.push({ url: value, options });
+    if (value.includes("127.0.0.1:8767/v1/swarm/workflow-engine/events")) {
+      return new Response(JSON.stringify({
+        acknowledged: 0,
+        events: [{
+          id: 1,
+          executionId: "execution-denied",
+          eventType: "TASK_STARTED",
+          workflowRunnerId: "runner-unknown",
+          workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+          definitionSnapshotHash: "d".repeat(64),
+          leaseFence: 1,
+          callbacks: {
+            progress:
+              "/v1/vaiworkflow/engine/executions/execution-denied/progress",
+          },
+          payload: {},
+        }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.endsWith("/execution-denied/progress")) {
+      return new Response(JSON.stringify({
+        error: "Access Denied",
+        message: "Authentication is required",
+      }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Unexpected request: ${value}`);
+  };
+
+  await assert.rejects(
+    forwardWorkflowEngineEventsOnce({
+      agent: engineAgent,
+      apiBase: "https://api-0.valkyrlabs.com/v1",
+      tokenProvider: async () => "session-token",
+      fetchImpl,
+    }),
+    /HTTP 403/,
+  );
+  assert.equal(calls.filter((call) => call.url.endsWith("/events/ack")).length, 0);
 });
 
 test("workflow runner capability is advertised only after a live loopback health check", async () => {
@@ -474,7 +691,10 @@ test("local runtime transport failures produce a fenced failure completion", asy
   }), /Local Workflow runtime transport failed/);
   assert.equal(completionBody.success, false);
   assert.equal(completionBody.errorType, "TRANSIENT");
-  assert.equal(completionBody.errorMessage, "Local Workflow runtime transport failed");
+  assert.equal(
+    completionBody.errorMessage,
+    "Local Workflow runtime transport failed: sidecar unavailable",
+  );
 });
 
 test("durable engine executes an immutable version snapshot and returns checkpoint state", async () => {

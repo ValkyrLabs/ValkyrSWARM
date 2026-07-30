@@ -21,8 +21,13 @@ import {
   writeMemory,
 } from "../scripts/swarm-graymatter.mjs";
 
-const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
-const SERVER_INFO = { name: "valkyr-swarm", version: "0.4.1" };
+const PROTECTED_ACTIONS = new Set([
+  "outbound.send",
+  "production.deploy",
+  "merge",
+  "service.lifecycle.restart",
+]);
+const SERVER_INFO = { name: "valkyr-swarm", version: "0.4.2" };
 
 const TOOLS = [
   {

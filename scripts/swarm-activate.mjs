@@ -28,16 +28,24 @@ const WORKFLOW_RUNNER_PROTOCOL = "valkyr-workflow-runner/v1";
 const WORKFLOW_ENGINE_PROTOCOL = "valkyr-workflow-engine/v1";
 
 const DEFAULT_CAPABILITIES = {
-  "claude-code": ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workspace.files.read"],
-  codex: ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workspace.files.read"],
+  "claude-code": ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workflow.remediate", "workspace.files.read"],
+  codex: ["code.execute", "engineering.project.execute", "pr.review", "merge", "workflow.debug", "workflow.remediate", "workspace.files.read"],
   openclaw: [
-    "task.write", "market.research", "crm.write", "inbound.triage", "cms.write",
+    "task.write", "ticket.create", "market.research", "content.research", "product.research",
+    "content.draft", "social.draft", "support.research",
+    "crm.write", "crm.upsert", "inbound.triage", "cms.write", "cms.upsert",
+    "website.experiment.propose", "outreach.draft",
     "outbound.send", "workflow.debug", "openclaw.skill.execute",
-    "openclaw.research-draft.execute",
+    "openclaw.research-draft.execute", "workflow.remediate",
   ],
-  valoride: ["code.execute", "engineering.project.execute", "pr.review", "production.deploy", "workflow.debug", "workspace.files.read"],
-  valklaw: ["task.write", "code.execute", "engineering.project.execute", "pr.review", "workflow.debug", "openclaw.skill.execute", "openclaw.research-draft.execute", "workspace.files.read"],
-  agent: ["task.write", "workflow.debug"],
+  valoride: ["code.execute", "engineering.project.execute", "pr.review", "production.deploy", "workflow.debug", "workflow.remediate", "workspace.files.read"],
+  valklaw: [
+    "task.write", "ticket.create", "code.execute", "engineering.project.execute",
+    "pr.review", "workflow.debug", "workflow.remediate", "openclaw.skill.execute",
+    "openclaw.research-draft.execute", "product.research", "content.draft",
+    "social.draft", "outreach.draft", "support.research", "workspace.files.read",
+  ],
+  agent: ["task.write", "ticket.create", "workflow.debug", "workflow.remediate"],
 };
 
 function usage(exitCode = 0) {
@@ -77,7 +85,7 @@ Options:
   --self-test                 Validate discovery/config contracts offline
   -h, --help                  Show this help
 
-Protected outbound.send, production.deploy, and merge actions require an exact
+Protected outbound.send, production.deploy, merge, and service.lifecycle.restart actions require an exact
 content-bound human approval reference from the authenticated mothership.
 `);
   process.exit(exitCode);

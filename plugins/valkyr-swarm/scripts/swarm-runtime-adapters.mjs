@@ -90,11 +90,11 @@ function buildRuntimePrompt(wire, agent) {
   const commandData = command?.payload?.data ?? command?.data ?? command?.payload ?? command;
   const scope = command?.scope ?? command?.payload?.metadata?.scope ?? command?.metadata?.scope;
   const approvalRef = String(command?.approvalRef ?? "").trim();
-  const approvedProtectedAction = ["outbound.send", "production.deploy", "merge"].includes(wire?.action)
+  const approvedProtectedAction = ["outbound.send", "production.deploy", "merge", "service.lifecycle.restart"].includes(wire?.action)
     && /^gm_approval_[0-9a-f]{64}$/.test(approvalRef)
     && command?.requiresApproval === true;
   const protectedActionInstruction = approvedProtectedAction
-    ? `Canonical human approval ${approvalRef} authorizes only the exact protected action ${wire.action}. Do not perform any other outbound send, production deployment, merge, destructive, financial, legal, or personnel action.`
+    ? `Canonical human approval ${approvalRef} authorizes only the exact protected action ${wire.action}. Do not perform any other outbound send, production deployment, merge, service restart, destructive, financial, legal, or personnel action.`
     : "Protected actions remain prohibited inside this task: do not send outbound messages, deploy to production, or merge changes. Stop and request a separately correlated human approval receipt if any protected action becomes necessary.";
   return [
     `Execute this governed tenant-scoped Valkyr SWARM task using the canonical ${agent.runtime} runtime.`,

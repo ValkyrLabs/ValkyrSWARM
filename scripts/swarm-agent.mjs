@@ -32,10 +32,25 @@ import {
   validateWorkflowRuntime,
   workflowRunnerMetadata,
 } from "./swarm-workflow-runtime.mjs";
+import {
+  DEFAULT_RECOVERY_ROOT,
+  SERVICE_RESTART_ACTION,
+  SERVICE_STATUS_ACTION,
+  buildServiceLifecycleState,
+  executeServiceLifecycleCommand,
+  readPendingRecoveries,
+  removePendingRecovery,
+  serviceLifecycleAdvertisement,
+} from "./swarm-service-lifecycle.mjs";
 
-const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
+const PROTECTED_ACTIONS = new Set([
+  "outbound.send",
+  "production.deploy",
+  "merge",
+  SERVICE_RESTART_ACTION,
+]);
 const DEFAULT_DURATION_SECONDS = 72 * 60 * 60;
-const PACKAGE_VERSION = "0.4.1";
+const PACKAGE_VERSION = "0.4.2";
 const MAX_COMMAND_BODY_BYTES = 1024 * 1024;
 const MAX_IDENTIFIER_LENGTH = 160;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
@@ -64,7 +79,7 @@ Options:
 
 Agents execute through productized Codex, Claude Code, OpenClaw, or ValorIDE
 runtime adapters and stream progress plus terminal receipts over SWARM. Explicit
-receipt-only agents never execute. outbound.send, production.deploy, and merge
+receipt-only agents never execute. outbound.send, production.deploy, merge, and supervised service restart
 are accepted only with an exact content-bound human approval reference from the
 authenticated mothership and an explicitly advertised capability.
 `);
@@ -295,7 +310,12 @@ function commandDisposition(wire, agent, workflowRuntimeState = agent?.workflowR
     }
   }
   const advertised = workflowRunnerMetadata(agent, workflowRuntimeState);
-  const supported = new Set([...(advertised.capabilities ?? []), ...(advertised.supportedTools ?? [])]);
+  const lifecycle = serviceLifecycleAdvertisement(agent, agent?.serviceLifecycleState);
+  const supported = new Set([
+    ...(advertised.capabilities ?? []),
+    ...(advertised.supportedTools ?? []),
+    ...(lifecycle.capabilities ?? []),
+  ]);
   if (!supported.has(action)) {
     return { disposition: "reject", protectedAction: false, reason: "action_not_advertised_by_agent" };
   }
@@ -353,7 +373,16 @@ class EvidenceLog {
 }
 
 class SwarmAgent {
-  constructor({ agent, apiBase, machineId, tokenProvider, url, heartbeatSeconds, evidence }) {
+  constructor({
+    agent,
+    apiBase,
+    machineId,
+    tokenProvider,
+    url,
+    heartbeatSeconds,
+    evidence,
+    recoveryRoot = DEFAULT_RECOVERY_ROOT,
+  }) {
     this.agent = agent;
     this.apiBase = apiBase;
     this.machineId = machineId;
@@ -378,6 +407,12 @@ class SwarmAgent {
     this.workflowEngineActiveExecutions = new Map();
     this.workflowEngineReplayActive = false;
     this.lastGrayMatterReplayAt = 0;
+    this.recoveryRoot = recoveryRoot;
+    this.serviceLifecycleState = buildServiceLifecycleState({
+      agent: this.agent,
+      machineId: this.machineId,
+    });
+    this.agent.serviceLifecycleState = this.serviceLifecycleState;
   }
 
   async connect() {
@@ -455,8 +490,10 @@ class SwarmAgent {
     const controlReply = controlReplyDestination(this.agent.agentId);
     this.subscribe(controlReply.destination, controlReply.id);
     void this.refreshWorkflowRuntime().then(() => {
+      this.refreshServiceLifecycle();
       this.sendRegistration();
       this.startHeartbeat();
+      void this.reconcilePendingServiceRecoveries();
       void this.replayWorkflowEngineEvents();
     });
     void this.replayGrayMatterReceipts(true);
@@ -519,6 +556,10 @@ class SwarmAgent {
 
   sendRegistration() {
     const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const lifecycle = serviceLifecycleAdvertisement(
+      { ...this.agent, capabilities: runner.capabilities },
+      this.serviceLifecycleState,
+    );
     const workflowRuntimeReady = (runner.supportedTools ?? []).some((tool) =>
       tool === "workflow.runner.execute-module" || tool === "workflow.engine.execute-workflow");
     this.sendControlMessage("register", {
@@ -529,6 +570,8 @@ class SwarmAgent {
         status: "healthy",
         capacity: Number(this.agent.capacity ?? 1),
         ...runner,
+        capabilities: lifecycle.capabilities,
+        serviceLifecycle: lifecycle.serviceLifecycle,
         approvalPolicy: "human-approval-required",
         executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
         receiptOnly: !this.agent.execution && !workflowRuntimeReady,
@@ -540,7 +583,10 @@ class SwarmAgent {
   startHeartbeat() {
     clearInterval(this.heartbeatTimer);
     void this.sendHeartbeat();
-    this.heartbeatTimer = setInterval(() => void this.sendHeartbeat(), this.heartbeatSeconds * 1000);
+    this.heartbeatTimer = setInterval(() => {
+      void this.sendHeartbeat()
+        .then(() => this.reconcilePendingServiceRecoveries());
+    }, this.heartbeatSeconds * 1000);
   }
 
   async refreshWorkflowRuntime() {
@@ -555,12 +601,35 @@ class SwarmAgent {
     });
   }
 
-  async sendHeartbeat() {
+  refreshServiceLifecycle() {
+    this.serviceLifecycleState = buildServiceLifecycleState({
+      agent: this.agent,
+      machineId: this.machineId,
+    });
+    this.agent.serviceLifecycleState = this.serviceLifecycleState;
+    this.evidence.record("service_lifecycle_probe", {
+      agentId: this.agent.agentId,
+      handles: this.serviceLifecycleState.metadata.services
+        .filter((service) => service.installed)
+        .map((service) => service.handle),
+      restartableHandles: this.serviceLifecycleState.metadata.services
+        .filter((service) => service.restartable)
+        .map((service) => service.handle),
+    });
+    return this.serviceLifecycleState;
+  }
+
+  async sendHeartbeat({ awaitAck = false } = {}) {
     await this.refreshWorkflowRuntime();
+    this.refreshServiceLifecycle();
     const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const lifecycle = serviceLifecycleAdvertisement(
+      { ...this.agent, capabilities: runner.capabilities },
+      this.serviceLifecycleState,
+    );
     const workflowRuntimeReady = (runner.supportedTools ?? []).some((tool) =>
       tool === "workflow.runner.execute-module" || tool === "workflow.engine.execute-workflow");
-    this.sendControlMessage("heartbeat", {
+    const heartbeat = this.sendControlMessage("heartbeat", {
       instanceId: this.agent.agentId,
       agentId: this.agent.agentId,
       runtime: this.agent.runtime,
@@ -569,12 +638,15 @@ class SwarmAgent {
       capacity: Number(this.agent.capacity ?? 1),
       activeTasks: this.inFlightCommands.size,
       ...runner,
+      capabilities: lifecycle.capabilities,
+      serviceLifecycle: lifecycle.serviceLifecycle,
       executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
       receiptOnly: !this.agent.execution && !workflowRuntimeReady,
-    });
+    }, { awaitAck });
     this.evidence.record("heartbeat_sent", { agentId: this.agent.agentId, machineId: this.machineId });
     void this.replayGrayMatterReceipts(false);
     void this.replayWorkflowEngineEvents();
+    return heartbeat;
   }
 
   async replayWorkflowEngineEvents() {
@@ -595,6 +667,14 @@ class SwarmAgent {
           agentId: this.agent.agentId,
           detail: redactedText(progress.text),
         }),
+        onDiscarded: ({ event, context, error }) =>
+          this.evidence.record("workflow_engine_event_fenced", {
+            agentId: this.agent.agentId,
+            executionId: String(
+              event?.executionId ?? context?.executionId ?? "unknown"),
+            eventId: Number(event?.id ?? 0),
+            code: error?.code ?? "WORKFLOW_ENGINE_CALLBACK_FENCED",
+          }),
         onEvent: async ({ event, context, terminal, checkpoint }) => {
           const eventType = String(event?.eventType ?? "UNKNOWN").toUpperCase();
           const executionId = String(event?.executionId ?? "unknown");
@@ -664,15 +744,36 @@ class SwarmAgent {
     }
   }
 
-  sendControlMessage(action, data) {
+  sendControlMessage(action, data, { awaitAck = false, timeoutMs = 15_000 } = {}) {
     const message = this.swarmMessage(action, data);
     const cutoff = Date.now() - 5 * 60 * 1000;
     for (const [id, pending] of this.pendingControlMessages) {
-      if (pending.sentAt < cutoff) this.pendingControlMessages.delete(id);
+      if (pending.sentAt < cutoff) {
+        clearTimeout(pending.timer);
+        pending.reject?.(new Error(`SWARM ${pending.action} acknowledgement timed out`));
+        this.pendingControlMessages.delete(id);
+      }
     }
-    this.pendingControlMessages.set(message.id, { action, sentAt: Date.now() });
+    if (!awaitAck) {
+      this.pendingControlMessages.set(message.id, { action, sentAt: Date.now() });
+      this.sendAppTopic("swarm", message);
+      return message.id;
+    }
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingControlMessages.delete(message.id);
+        reject(new Error(`SWARM ${action} acknowledgement timed out`));
+      }, timeoutMs);
+      this.pendingControlMessages.set(message.id, {
+        action,
+        reject,
+        resolve,
+        sentAt: Date.now(),
+        timer,
+      });
+    });
     this.sendAppTopic("swarm", message);
-    return message.id;
+    return promise;
   }
 
   onServerControlReply(body) {
@@ -680,6 +781,7 @@ class SwarmAgent {
     if (!reply) return;
     const pending = this.pendingControlMessages.get(reply.ackId);
     if (!pending) return;
+    clearTimeout(pending.timer);
     this.pendingControlMessages.delete(reply.ackId);
     const accepted = reply.topic === "ack" && reply.status !== "rejected";
     this.evidence.record(`${pending.action}_${accepted ? "ack" : "nack"}`, {
@@ -691,6 +793,8 @@ class SwarmAgent {
       code: reply.code,
       error: reply.error,
     });
+    if (accepted) pending.resolve?.(reply);
+    else pending.reject?.(new Error(reply.error ?? reply.code ?? `${pending.action} rejected`));
   }
 
   async replayGrayMatterReceipts(force) {
@@ -774,6 +878,151 @@ class SwarmAgent {
     }
   }
 
+  async verifyServiceRecovery(binding, notBefore = Date.now()) {
+    const deadline = Date.now() + 60_000;
+    let publicService = null;
+    while (Date.now() < deadline) {
+      this.refreshServiceLifecycle();
+      publicService = this.serviceLifecycleState.services
+        .find(({ binding: candidate }) => candidate.handle === binding.handle)?.public ?? null;
+      if (binding.handle === "workflow-engine" || binding.handle === "workflow-runner") {
+        await this.refreshWorkflowRuntime();
+        if (publicService?.running && this.workflowRuntimeState?.healthy === true) break;
+      } else if (publicService?.running
+          && this.websocket?.readyState === WebSocket.OPEN) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    const runtimeHealthy = binding.handle === "workflow-engine" || binding.handle === "workflow-runner"
+      ? this.workflowRuntimeState?.healthy === true
+      : this.websocket?.readyState === WebSocket.OPEN;
+    if (!publicService?.running || !runtimeHealthy) {
+      throw new Error(`Service ${binding.handle} did not become healthy after restart`);
+    }
+    const heartbeatAck = await this.sendHeartbeat({ awaitAck: true });
+    const heartbeatAt = Date.parse(String(heartbeatAck?.data?.lastSeen ?? ""));
+    const heartbeatFresh = Number.isFinite(heartbeatAt) && heartbeatAt >= notBefore - 5_000;
+    if (!heartbeatFresh) {
+      throw new Error(`Service ${binding.handle} heartbeat was not fresh after restart`);
+    }
+    const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const lifecycle = serviceLifecycleAdvertisement(
+      { ...this.agent, capabilities: runner.capabilities },
+      this.serviceLifecycleState,
+    );
+    return {
+      capabilities: lifecycle.capabilities,
+      expectedAgentId: binding.agentId,
+      handle: binding.handle,
+      healthy: true,
+      heartbeatAt: new Date(heartbeatAt).toISOString(),
+      heartbeatFresh: true,
+      supervisorRunning: true,
+      version: binding.handle === "workflow-engine" || binding.handle === "workflow-runner"
+        ? this.workflowRuntimeState?.version ?? null
+        : this.agent.version ?? `valkyr-swarm/${PACKAGE_VERSION}`,
+    };
+  }
+
+  async reconcilePendingServiceRecoveries() {
+    const pending = readPendingRecoveries({
+      agentId: this.agent.agentId,
+      recoveryRoot: this.recoveryRoot,
+    });
+    for (const item of pending) {
+      const createdAt = Date.parse(item.record.createdAt);
+      const ageMs = Number.isFinite(createdAt) ? Date.now() - createdAt : Number.POSITIVE_INFINITY;
+      const resolved = this.serviceLifecycleState.bindings
+        .find((candidate) => candidate.handle === item.record.serviceHandle);
+      const wire = {
+        action: SERVICE_RESTART_ACTION,
+        command: {
+          action: SERVICE_RESTART_ACTION,
+          approvalRef: item.record.approvalRef,
+          payload: {
+            expectedMachineId: item.record.expectedMachineId,
+            serviceHandle: item.record.serviceHandle,
+          },
+          requiresApproval: true,
+        },
+        commandId: item.record.commandId,
+        targetInstanceId: item.record.targetInstanceId,
+        trace: item.record.traceId ? { traceId: item.record.traceId } : {},
+      };
+      try {
+        if (!resolved) {
+          throw new Error(`Service ${item.record.serviceHandle} is no longer configured`);
+        }
+        const proof = await this.verifyServiceRecovery(
+          resolved,
+          Number.isFinite(createdAt) ? createdAt : Date.now(),
+        );
+        const completed = {
+          type: "ACK",
+          status: "completed",
+          result: {
+            adapter: "native-service-lifecycle",
+            executed: true,
+            pendingRecovery: false,
+            receiptOnly: false,
+            serviceHandle: resolved.handle,
+            supervisor: resolved.supervisor,
+            proof,
+          },
+        };
+        const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
+        completed.result.grayMatterReceiptRef = memoryReceipt.id
+          ? `MemoryEntry:${memoryReceipt.id}` : null;
+        completed.result.grayMatterReceiptStatus = memoryReceipt.status;
+        this.rememberCompleted(wire.commandId, completed);
+        this.sendCommandResponse(wire, completed);
+        removePendingRecovery(item.path, this.recoveryRoot);
+        this.evidence.record("service_recovery_reconciled", {
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          serviceHandle: resolved.handle,
+          heartbeatAt: proof.heartbeatAt,
+        });
+      } catch (error) {
+        if (ageMs < 120_000) {
+          this.evidence.record("service_recovery_pending", {
+            agentId: this.agent.agentId,
+            commandId: wire.commandId,
+            error: redactedError(error),
+            serviceHandle: item.record.serviceHandle,
+          });
+          continue;
+        }
+        const failed = {
+          type: "NACK",
+          status: "failed",
+          reason: redactedError(error),
+          result: {
+            adapter: "native-service-lifecycle",
+            executed: false,
+            pendingRecovery: false,
+            receiptOnly: false,
+            serviceHandle: item.record.serviceHandle,
+          },
+        };
+        const memoryReceipt = await this.persistTerminalReceipt(wire, failed);
+        failed.result.grayMatterReceiptRef = memoryReceipt.id
+          ? `MemoryEntry:${memoryReceipt.id}` : null;
+        failed.result.grayMatterReceiptStatus = memoryReceipt.status;
+        this.rememberCompleted(wire.commandId, failed);
+        this.sendCommandResponse(wire, failed);
+        removePendingRecovery(item.path, this.recoveryRoot);
+        this.evidence.record("service_recovery_failed", {
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          error: redactedError(error),
+          serviceHandle: item.record.serviceHandle,
+        });
+      }
+    }
+  }
+
   onMessage(body) {
     if (Buffer.byteLength(String(body), "utf8") > MAX_COMMAND_BODY_BYTES) {
       this.evidence.record("command_ignored", { agentId: this.agent.agentId, reason: "command_payload_too_large" });
@@ -848,9 +1097,11 @@ class SwarmAgent {
       return;
     }
 
+    const serviceLifecycle = [SERVICE_STATUS_ACTION, SERVICE_RESTART_ACTION]
+      .includes(wire.action);
     const workflowRuntime = supportsWorkflowRuntimeAction(
       this.agent, this.workflowRuntimeState, wire.action);
-    if (!this.agent.execution && !workflowRuntime) {
+    if (!this.agent.execution && !workflowRuntime && !serviceLifecycle) {
       const received = {
         type: "ACK",
         status: "pilot_received",
@@ -870,7 +1121,9 @@ class SwarmAgent {
       return;
     }
 
-    const adapter = workflowRuntime ? "workflow-runtime-http" : this.agent.execution?.adapter;
+    const adapter = serviceLifecycle
+      ? "native-service-lifecycle"
+      : workflowRuntime ? "workflow-runtime-http" : this.agent.execution?.adapter;
     this.sendCommandResponse(wire, {
       type: "ACK",
       status: "started",
@@ -911,8 +1164,17 @@ class SwarmAgent {
           traceId: wire.trace?.traceId,
         });
       };
-    const execution = (workflowRuntime
-      ? executeWorkflowRuntimeCommand({
+    const execution = (serviceLifecycle
+      ? executeServiceLifecycleCommand({
+          agent: this.agent,
+          machineId: this.machineId,
+          onProgress,
+          recoveryRoot: this.recoveryRoot,
+          state: this.serviceLifecycleState,
+          verifyRecovery: (binding) => this.verifyServiceRecovery(binding),
+          wire,
+        })
+      : workflowRuntime ? executeWorkflowRuntimeCommand({
           agent: this.agent,
           wire,
           apiBase: this.apiBase,
@@ -921,6 +1183,22 @@ class SwarmAgent {
         })
       : executeRuntimeCommand({ agent: this.agent, wire, onProgress }))
       .then(async (result) => {
+        if (result?.pendingRecovery === true) {
+          const pending = {
+            type: "ACK",
+            status: "progress",
+            result,
+          };
+          this.sendCommandResponse(wire, pending);
+          this.evidence.record("service_recovery_checkpointed", {
+            action: wire.action,
+            agentId: this.agent.agentId,
+            commandId: wire.commandId,
+            serviceHandle: result.serviceHandle,
+            traceId: wire.trace?.traceId,
+          });
+          return;
+        }
         const engineState = wire.action === "workflow.engine.execute-workflow"
           ? String(result?.terminalState ?? "SUCCESS").toUpperCase()
           : "SUCCESS";
@@ -1001,6 +1279,11 @@ class SwarmAgent {
 
   onClose(event) {
     clearInterval(this.heartbeatTimer);
+    for (const [id, pending] of this.pendingControlMessages) {
+      clearTimeout(pending.timer);
+      pending.reject?.(new Error(`SWARM ${pending.action} disconnected before acknowledgement`));
+      this.pendingControlMessages.delete(id);
+    }
     if (this.stopped) return;
     this.evidence.record("disconnected", {
       agentId: this.agent.agentId,
@@ -1099,7 +1382,7 @@ async function selfTest() {
   if (wire.commandId !== "cmd-1" || wire.action !== "content.research" || wire.trace.traceId !== "ceo:d:t") {
     throw new Error("SWARM wire command parsing failed");
   }
-  for (const action of ["outbound.send", "production.deploy", "merge"]) {
+  for (const action of ["outbound.send", "production.deploy", "merge", "service.lifecycle.restart"]) {
     if (!PROTECTED_ACTIONS.has(action)) throw new Error(`Missing protected action: ${action}`);
   }
   const routingAgent = { agentId: "agent-1", capabilities: ["content.research"] };

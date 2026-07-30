@@ -30,9 +30,17 @@ Repeated activation on one physical machine merges stable agent IDs into one pri
 - Linux: systemd user unit under `~/.config/systemd/user`.
 - Other platforms: foreground Node process owned by the calling runtime.
 
+## Governed service lifecycle
+
+`service.lifecycle.status` and `service.lifecycle.restart` accept only one exact registered agent, its expected machine ID, and a semantic allowlisted handle: `codex`, `openclaw`, `valoride`, `swarm-bridge`, `workflow-runner`, `workflow-engine`, or an explicitly supervised `claude-code` bridge. Native launchd/systemd labels and paths are derived locally from canonical configuration and never accepted from the caller.
+
+Capabilities are advertised only after a real native supervisor definition is discovered. ValorIDE means its SWARM bridge/runner, not an arbitrary desktop GUI process. Ordinary Claude Code CLI sessions are bounded tasks, not restartable services.
+
+Restart is protected. A shared-bridge self-restart writes a private pending-recovery record before invoking the supervisor and reconciles the terminal receipt after reconnect. Completion always requires supervisor health, a fresh expected agent heartbeat, version/capabilities, and a terminal GrayMatter receipt; accepted delivery is never completion.
+
 ## Protected actions
 
-`outbound.send`, `production.deploy`, and `merge` are denied by the portable MCP and by the local bridge unless the authenticated mothership sends an exact-target command containing the server-injected, content-bound `gm_approval_...` reference produced by the canonical human approval control surface. The node must also explicitly advertise the protected capability. A prompt-supplied receipt reference, chat approval, or capability advertisement alone never constitutes approval.
+`outbound.send`, `production.deploy`, `merge`, and `service.lifecycle.restart` are denied by the portable MCP and by the local bridge unless the authenticated mothership sends an exact-target command containing the server-injected, content-bound `gm_approval_...` reference produced by the canonical human approval control surface. The node must also explicitly advertise the protected capability. A prompt-supplied receipt reference, chat approval, or capability advertisement alone never constitutes approval.
 
 ## Completion evidence
 

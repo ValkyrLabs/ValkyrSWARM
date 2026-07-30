@@ -1,22 +1,64 @@
 const WORKFLOW_RUNNER_ACTION = "workflow.runner.execute-module";
 const WORKFLOW_ENGINE_ACTION = "workflow.engine.execute-workflow";
 const WORKFLOW_ENGINE_KILL_ACTION = "workflow.engine.kill-execution";
+const WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION =
+  "workflow.engine.deny-approval";
 const DEFAULT_TIMEOUT_SECONDS = 900;
 const MAX_RUNTIME_RESPONSE_BYTES = 2 * 1024 * 1024;
 const WORKFLOW_RUNNER_PROTOCOL = "valkyr-workflow-runner/v1";
 const WORKFLOW_ENGINE_PROTOCOL = "valkyr-workflow-engine/v1";
 const DEPLOYMENT_RUNNER_CAPABILITY = "deployment.runner.execute";
 const DEPLOYMENT_RUNNER_PROTOCOL = "valkyr-deployment-runner/v1";
+const SENSITIVE_ERROR_FIELD =
+  /(password|passwd|secret|token|credential|authorization|api[-_.]?key|bearer)(\s*[=:]\s*)([^\s,;]+)/gi;
+const JWT_VALUE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const DEFINITIVE_WORKFLOW_CALLBACK_FENCE_CODES = new Set([
+  "WORKFLOW_ENGINE_CALLBACK_RUNNER_NOT_OWNER",
+  "WORKFLOW_ENGINE_CALLBACK_LEASE_STALE",
+]);
 const WORKFLOW_ACTIONS = new Set([
   WORKFLOW_RUNNER_ACTION,
   WORKFLOW_ENGINE_ACTION,
   WORKFLOW_ENGINE_KILL_ACTION,
+  WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION,
 ]);
 
 function stringList(value) {
   return Array.isArray(value)
     ? [...new Set(value.map((item) => String(item ?? "").trim()).filter(Boolean))]
     : [];
+}
+
+function workflowRuntimeTransportFailure(error) {
+  const prefix = "Local Workflow runtime transport failed";
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const detail = raw
+    .replace(SENSITIVE_ERROR_FIELD, "$1$2[REDACTED]")
+    .replace(JWT_VALUE, "[REDACTED_JWT]")
+    .replace(/[\r\n\t]+/g, " ")
+    .trim()
+    .slice(0, 480);
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
+class RemoteWorkflowCallbackError extends Error {
+  constructor(status, code, retryable) {
+    const stableCode = typeof code === "string" && code
+      ? code
+      : "REMOTE_WORKFLOW_CALLBACK_REJECTED";
+    super(`Remote workflow callback failed with HTTP ${status} (${stableCode})`);
+    this.name = "RemoteWorkflowCallbackError";
+    this.status = Number(status);
+    this.code = stableCode;
+    this.retryable = retryable !== false;
+  }
+}
+
+function isDefinitiveWorkflowCallbackFence(error) {
+  return error instanceof RemoteWorkflowCallbackError
+    && error.status === 409
+    && error.retryable === false
+    && DEFINITIVE_WORKFLOW_CALLBACK_FENCE_CODES.has(error.code);
 }
 
 function moduleAbiHashes(value) {
@@ -164,6 +206,7 @@ async function forwardWorkflowEngineEventsOnce({
   fetchImpl = fetch,
   onProgress,
   onEvent,
+  onDiscarded,
 }) {
   const config = workflowRuntimeConfig(agent);
   if (!config || config.tier !== "engine" || !config.eventsEndpoint) {
@@ -202,36 +245,48 @@ async function forwardWorkflowEngineEventsOnce({
     };
     const terminal = ["SUCCESS", "FAILED", "CANCELLED"].includes(eventType);
     const checkpoint = eventType === "CHECKPOINT";
-    if (terminal || checkpoint) {
-      const completeUrl = callbackUrl(apiBase, callbacks.complete);
-      const checkpointState = String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType);
-      const successful = !["FAILED", "CANCELLED"].includes(checkpointState);
-      await authorizedJson(completeUrl, {
-        workflowExecutionId: executionId,
-        workflowRunnerId: context.workflowRunnerId,
-        workflowVersionId: context.workflowVersionId,
-        definitionSnapshotHash: context.definitionSnapshotHash,
-        leaseFence: context.leaseFence,
-        success: successful,
-        terminalState: checkpointState,
-        finalState: event?.payload?.finalState ?? {},
-        checkpointRef: event?.payload?.checkpointRef ?? null,
-        approvalRef: event?.payload?.approvalRef ?? null,
-        waitingUntil: event?.payload?.waitingUntil ?? null,
-        errorMessage: successful ? null : String(event?.payload?.errorMessage ?? checkpointState),
-        errorType: successful ? null : "PERMANENT",
-        swarmReceiptRef: `swarm-engine-event:${eventId}`,
-      }, tokenProvider, fetchImpl);
-    } else if (callbacks.progress) {
-      await authorizedJson(callbackUrl(apiBase, callbacks.progress), {
-        workflowExecutionId: executionId,
-        workflowRunnerId: context.workflowRunnerId,
-        leaseFence: context.leaseFence,
-        eventId,
-        eventType,
-        payload: event?.payload ?? {},
-        createdAt: event?.createdAt ?? null,
-      }, tokenProvider, fetchImpl);
+    try {
+      if (terminal || checkpoint) {
+        const completeUrl = callbackUrl(apiBase, callbacks.complete);
+        const checkpointState = String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType);
+        const successful = !["FAILED", "CANCELLED"].includes(checkpointState);
+        await authorizedJson(completeUrl, {
+          workflowExecutionId: executionId,
+          workflowRunnerId: context.workflowRunnerId,
+          workflowVersionId: context.workflowVersionId,
+          definitionSnapshotHash: context.definitionSnapshotHash,
+          leaseFence: context.leaseFence,
+          success: successful,
+          terminalState: checkpointState,
+          finalState: event?.payload?.finalState ?? {},
+          checkpointRef: event?.payload?.checkpointRef ?? null,
+          approvalRef: event?.payload?.approvalRef ?? null,
+          waitingUntil: event?.payload?.waitingUntil ?? null,
+          errorMessage: successful ? null : String(event?.payload?.errorMessage ?? checkpointState),
+          errorType: successful ? null : "PERMANENT",
+          swarmReceiptRef: `swarm-engine-event:${eventId}`,
+        }, tokenProvider, fetchImpl);
+      } else if (callbacks.progress) {
+        await authorizedJson(callbackUrl(apiBase, callbacks.progress), {
+          workflowExecutionId: executionId,
+          workflowRunnerId: context.workflowRunnerId,
+          leaseFence: context.leaseFence,
+          eventId,
+          eventType,
+          payload: event?.payload ?? {},
+          createdAt: event?.createdAt ?? null,
+        }, tokenProvider, fetchImpl);
+      }
+    } catch (error) {
+      if (!isDefinitiveWorkflowCallbackFence(error)) throw error;
+      active.delete(executionId);
+      next = eventId;
+      await onDiscarded?.({ event, context, error });
+      onProgress?.({
+        stream: "workflow",
+        text: `Discarded fenced Workflow engine event ${eventType} (${eventId})`,
+      });
+      continue;
     }
     if (terminal) active.delete(executionId);
     else active.set(executionId, context);
@@ -239,9 +294,20 @@ async function forwardWorkflowEngineEventsOnce({
     next = eventId;
     onProgress?.({ stream: "workflow", text: `Workflow engine event ${eventType} (${eventId})` });
   }
-  for (const context of active.values()) {
+  for (const [executionId, context] of [...active.entries()]) {
     if (context.callbacks?.heartbeat) {
-      await authorizedJson(callbackUrl(apiBase, context.callbacks.heartbeat), undefined, tokenProvider, fetchImpl);
+      try {
+        await authorizedJson(
+          callbackUrl(apiBase, context.callbacks.heartbeat),
+          undefined,
+          tokenProvider,
+          fetchImpl,
+        );
+      } catch (error) {
+        if (!isDefinitiveWorkflowCallbackFence(error)) throw error;
+        active.delete(executionId);
+        await onDiscarded?.({ event: null, context, error });
+      }
     }
   }
   if (next > acknowledged) {
@@ -296,7 +362,9 @@ async function probeWorkflowRuntime(agent, { fetchImpl = fetch } = {}) {
     const state = String(body?.status ?? body?.state ?? "unknown").toLowerCase();
     const reportedTools = stringList(body?.supportedTools).filter((tool) => WORKFLOW_ACTIONS.has(tool));
     const supportedTools = reportedTools.filter((tool) => config.tier === "engine"
-      ? tool === WORKFLOW_ENGINE_ACTION || tool === WORKFLOW_ENGINE_KILL_ACTION
+      ? tool === WORKFLOW_ENGINE_ACTION
+        || tool === WORKFLOW_ENGINE_KILL_ACTION
+        || tool === WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION
       : tool === WORKFLOW_RUNNER_ACTION);
     const protocol = String(body?.protocol ?? "");
     const protocols = stringList(body?.protocols ?? [protocol]);
@@ -432,9 +500,18 @@ async function authorizedJson(url, body, tokenProvider, fetchImpl) {
   let response = await send(false);
   if (response.status === 401 || response.status === 403) response = await send(true);
   const text = await response.text();
-  if (!response.ok) throw new Error(`Remote workflow callback failed with HTTP ${response.status}: ${text.slice(0, 240)}`);
-  if (!text) return null;
-  try { return JSON.parse(text); } catch { return { text: text.slice(0, 8_000) }; }
+  let parsed = null;
+  if (text) {
+    try { parsed = JSON.parse(text); } catch { parsed = { text: text.slice(0, 8_000) }; }
+  }
+  if (!response.ok) {
+    throw new RemoteWorkflowCallbackError(
+      response.status,
+      parsed?.code,
+      parsed?.retryable,
+    );
+  }
+  return parsed;
 }
 
 async function readRuntimeResponse(response, onProgress) {
@@ -507,6 +584,71 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
       artifact: result,
     };
   }
+  if (wire.action === WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION) {
+    if (config.tier !== "engine"
+        || !payload?.workflowExecutionId
+        || !payload?.workflowRunnerId
+        || !payload?.workflowVersionId
+        || !/^[a-f0-9]{64}$/.test(String(payload?.definitionSnapshotHash ?? ""))
+        || !Number.isSafeInteger(Number(payload?.leaseFence))
+        || !payload?.checkpointId
+        || !payload?.approvalId
+        || !payload?.continuationIntentId
+        || !["DENIED", "CHANGES_REQUESTED"].includes(
+          String(payload?.decisionStatus ?? ""))
+        || !/^[a-f0-9]{64}$/.test(String(payload?.completionDigest ?? ""))
+        || !["FAIL_EXECUTION", "COMPENSATE_AND_FAIL", "SKIP_TO_TASK"].includes(
+          String(payload?.denialMode ?? ""))
+        || !payload?.remoteCheckpointRef
+        || (payload.denialMode === "SKIP_TO_TASK"
+          ? !payload?.denialResumeTaskId
+          : Boolean(payload?.denialResumeTaskId))) {
+      throw new Error(
+        "Remote Workflow engine approval denial command is incomplete");
+    }
+    const denialUrl = new URL(
+      `/v1/swarm/workflow-engine/executions/${encodeURIComponent(
+        payload.workflowExecutionId)}/approval-denied`,
+      config.endpoint,
+    );
+    const response = await fetchImpl(denialUrl, {
+      method: "POST",
+      signal: AbortSignal.timeout(config.timeoutSeconds * 1000),
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, application/x-ndjson",
+        "X-Valkyr-Swarm-Command-Id": wire.commandId,
+      },
+      body: JSON.stringify({
+        workflowExecutionId: payload.workflowExecutionId,
+        workflowRunnerId: payload.workflowRunnerId,
+        workflowVersionId: payload.workflowVersionId,
+        definitionSnapshotHash: payload.definitionSnapshotHash,
+        leaseFence: Number(payload.leaseFence),
+        checkpointId: payload.checkpointId,
+        approvalId: payload.approvalId,
+        continuationIntentId: payload.continuationIntentId,
+        decisionStatus: payload.decisionStatus,
+        completionDigest: payload.completionDigest,
+        denialMode: payload.denialMode,
+        denialResumeTaskId: payload.denialResumeTaskId ?? null,
+        remoteCheckpointRef: payload.remoteCheckpointRef,
+      }),
+    });
+    const result = await readRuntimeResponse(response, onProgress);
+    return {
+      adapter: "workflow-runtime-http",
+      executed: false,
+      receiptOnly: false,
+      status: "approval_denial_applied",
+      workflowExecutionId: payload.workflowExecutionId,
+      workflowRunnerId: payload.workflowRunnerId,
+      leaseFence: Number(payload.leaseFence),
+      terminalState: result?.terminalState ?? null,
+      checkpointRef: result?.checkpointRef ?? null,
+      artifact: result,
+    };
+  }
   const callbacks = payload?.callbacks;
   const engineExecution = wire.action === WORKFLOW_ENGINE_ACTION;
   const identityField = engineExecution ? "workflowExecutionId" : "runId";
@@ -571,7 +713,7 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
       type: "failed",
       success: false,
       outputs: {},
-      errorMessage: "Local Workflow runtime transport failed",
+      errorMessage: workflowRuntimeTransportFailure(error),
       errorType: "TRANSIENT",
     };
   } finally {
@@ -626,6 +768,7 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
 
 export {
   WORKFLOW_ENGINE_ACTION,
+  WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION,
   WORKFLOW_ENGINE_KILL_ACTION,
   WORKFLOW_ENGINE_PROTOCOL,
   WORKFLOW_RUNNER_ACTION,
@@ -637,5 +780,6 @@ export {
   supportsWorkflowRuntimeAction,
   validateWorkflowRuntime,
   workflowRunnerMetadata,
+  workflowRuntimeTransportFailure,
   workflowRuntimeConfig,
 };

@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   WORKFLOW_ENGINE_ACTION,
+  WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION,
   WORKFLOW_ENGINE_KILL_ACTION,
   WORKFLOW_RUNNER_ACTION,
   executeWorkflowRuntimeCommand,
@@ -109,6 +110,27 @@ async function waitForHealth(url, child) {
   throw new Error("Workflow engine did not become healthy");
 }
 
+async function withRuntimeDiagnostics(operation, readRuntimeLog) {
+  try {
+    return await operation();
+  } catch (error) {
+    const sanitizedLog = String(readRuntimeLog?.() ?? "")
+      .replace(
+        /(password|passwd|secret|token|credential|authorization|api[-_.]?key|bearer)(\s*[=:]\s*)([^\s,;]+)/gi,
+        "$1$2[REDACTED]",
+      )
+      .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]");
+    const diagnosticLog = sanitizedLog.length <= 12_000
+      ? sanitizedLog
+      : `${sanitizedLog.slice(0, 6_000)}\n... log middle omitted ...\n${sanitizedLog.slice(-6_000)}`;
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}`
+        + (diagnosticLog ? `\nWorkflow runtime diagnostic log:\n${diagnosticLog}` : ""),
+      { cause: error },
+    );
+  }
+}
+
 test("productized service invocation boots, advertises, and executes the stateless runner artifact", {
   skip: !runnerArtifact,
   timeout: 90_000,
@@ -195,7 +217,7 @@ test("productized service invocation boots, advertises, and executes the statele
     }
     return fetch(url, options);
   };
-  const result = await executeWorkflowRuntimeCommand({
+  const result = await withRuntimeDiagnostics(() => executeWorkflowRuntimeCommand({
     agent,
     apiBase: "https://api-0.valkyrlabs.com/v1",
     tokenProvider: async () => "private-test-session",
@@ -216,7 +238,7 @@ test("productized service invocation boots, advertises, and executes the statele
         },
       },
     },
-  });
+  }), () => runtimeLog);
   assert.equal(result.executed, true);
   assert.equal(completion.success, true);
   assert.equal(completion.outputs.answer, 42);
@@ -266,6 +288,11 @@ test("productized service invocation boots, advertises, and executes the durable
   const metadata = workflowRunnerMetadata(agent, state);
   assert.equal(state.healthy, true);
   assert.equal(metadata.supportedTools.includes(WORKFLOW_ENGINE_ACTION), true);
+  assert.equal(
+    metadata.supportedTools.includes(
+      WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION),
+    true,
+  );
   assert.equal(metadata.supportedTools.includes(WORKFLOW_ENGINE_KILL_ACTION), true);
 
   const moduleClass = "com.valkyrlabs.workflow.modules.basic.MapInjectModule";
@@ -334,7 +361,7 @@ test("productized service invocation boots, advertises, and executes the durable
     }
     return fetch(url, options);
   };
-  const result = await executeWorkflowRuntimeCommand({
+  const result = await withRuntimeDiagnostics(() => executeWorkflowRuntimeCommand({
     agent,
     apiBase: "https://api-0.valkyrlabs.com/v1",
     tokenProvider: async () => "private-test-session",
@@ -356,7 +383,7 @@ test("productized service invocation boots, advertises, and executes the durable
         },
       },
     },
-  });
+  }), () => runtimeLog);
   assert.equal(result.executed, true);
   assert.equal(completion.terminalState, "SUCCESS");
   assert.equal(completion.finalState.answer, 42);
@@ -546,7 +573,7 @@ test("productized durable engine suspends an outbound pack and resumes only with
     }
     return fetch(url, options);
   };
-  const execute = (commandId) => executeWorkflowRuntimeCommand({
+  const execute = (commandId) => withRuntimeDiagnostics(() => executeWorkflowRuntimeCommand({
     agent,
     apiBase: "https://api-0.valkyrlabs.com/v1",
     tokenProvider: async () => "private-test-session",
@@ -568,7 +595,7 @@ test("productized durable engine suspends an outbound pack and resumes only with
         },
       },
     },
-  });
+  }), () => runtimeLog);
 
   const waiting = await execute("engine-approval-waiting-e2e");
   assert.equal(waiting.executed, true);
@@ -600,5 +627,196 @@ test("productized durable engine suspends an outbound pack and resumes only with
       idempotencyKey: "bounded-productized-e2e",
     },
   });
+  assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
+});
+
+test("productized durable engine exits a stopped Looper through the immutable End control target", {
+  skip: !artifact,
+  timeout: 90_000,
+}, async (context) => {
+  const resolvedArtifact = path.resolve(artifact);
+  assert.equal(fs.existsSync(resolvedArtifact) && fs.statSync(resolvedArtifact).isFile(), true,
+    `Missing engine artifact: ${resolvedArtifact}`);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-engine-terminal-e2e-"));
+  const port = await availablePort();
+  const configPath = path.join(root, "agent.json");
+  const agent = writeRuntimeConfig({
+    agentId: "codex-engine-terminal-e2e",
+    artifactPath: resolvedArtifact,
+    configPath,
+    endpoint: new URL(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/execute`),
+    root,
+    tier: "engine",
+  });
+  const child = startProductizedRuntime(configPath, agent.agentId);
+  let runtimeLog = "";
+  child.stdout.on("data", (chunk) => { runtimeLog += chunk.toString(); });
+  child.stderr.on("data", (chunk) => { runtimeLog += chunk.toString(); });
+  context.after(async () => {
+    if (child.exitCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([
+        new Promise((resolve) => child.once("exit", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 3_000)),
+      ]);
+      if (child.exitCode === null) child.kill("SIGKILL");
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const healthUrl = `http://127.0.0.1:${port}/v1/swarm/workflow-engine/health`;
+  const health = await waitForHealth(healthUrl, child);
+  const looperClass = "com.valkyrlabs.workflow.modules.control.LooperModule";
+  const bodyClass = "com.valkyrlabs.workflow.modules.basic.MapInjectModule";
+  const looperHash = health.moduleAbiHashes?.[looperClass];
+  const bodyHash = health.moduleAbiHashes?.[bodyClass];
+  assert.match(looperHash ?? "", /^[a-f0-9]{64}$/);
+  assert.match(bodyHash ?? "", /^[a-f0-9]{64}$/);
+
+  const workflowVersionId = "1c92dcfb-48ef-4dc4-9583-86f851900ad1";
+  const workflowExecutionId = "2c92dcfb-48ef-4dc4-9583-86f851900ad2";
+  const workflowRunnerId = "3c92dcfb-48ef-4dc4-9583-86f851900ad3";
+  const graph = {
+    workflow: {
+      id: "4c92dcfb-48ef-4dc4-9583-86f851900ad4",
+      name: "Stopped Looper terminal E2E",
+    },
+    nodes: [
+      { nodeId: "start", type: "start", label: "Start" },
+      {
+        nodeId: "loop",
+        taskId: "5c92dcfb-48ef-4dc4-9583-86f851900ad5",
+        type: "looper",
+        label: "Looper while running == true",
+      },
+      {
+        nodeId: "body",
+        taskId: "6c92dcfb-48ef-4dc4-9583-86f851900ad6",
+        type: "task",
+        label: "Body must not execute",
+      },
+      { nodeId: "end", type: "end", label: "End" },
+    ],
+    edges: [
+      { edgeId: "start-loop", source: "start", target: "loop" },
+      { edgeId: "loop-body", source: "loop", target: "body" },
+      { edgeId: "body-loop", source: "body", target: "loop" },
+      { edgeId: "loop-end", source: "loop", target: "end" },
+    ],
+    modules: [
+      {
+        moduleId: "7c92dcfb-48ef-4dc4-9583-86f851900ad7",
+        nodeId: "loop",
+        className: looperClass,
+        name: "Stopped Looper",
+        execModuleConfig: {
+          payloadConfig: {
+            parameters: JSON.stringify({
+              loopType: "WHILE",
+              condition: "running == true",
+              bodyNodeId: "body",
+              exitNodeId: "end",
+              loopStateKey: "business.cycles",
+              maxIterations: 10,
+            }),
+          },
+        },
+      },
+      {
+        moduleId: "8c92dcfb-48ef-4dc4-9583-86f851900ad8",
+        nodeId: "body",
+        className: bodyClass,
+        name: "Body must not execute",
+        execModuleConfig: {
+          payloadConfig: {
+            parameters: JSON.stringify({ bodyExecuted: true }),
+          },
+        },
+      },
+    ],
+  };
+  const definitionSnapshot = JSON.stringify({ schemaVersion: 1, submittedGraph: graph });
+  const definitionSnapshotHash =
+    crypto.createHash("sha256").update(definitionSnapshot).digest("hex");
+  const logicalIdempotencyKey = `swarm-engine-terminal-e2e:${definitionSnapshotHash}`;
+  const callbacks = {
+    heartbeat:
+      `/v1/vaiworkflow/engine/executions/${workflowExecutionId}/heartbeat/${workflowRunnerId}/11`,
+    materialize:
+      `/v1/vaiworkflow/engine/executions/${workflowExecutionId}/materialize/${workflowRunnerId}/11`,
+    complete: "/v1/vaiworkflow/engine/executions/complete",
+  };
+  const materialization = {
+    protocol: "valkyr-workflow-engine/v1",
+    workflowExecutionId,
+    workflowRunnerId,
+    leaseFence: 11,
+    logicalIdempotencyKey,
+    workflowVersionId,
+    definitionSnapshotHash,
+    abiHash: "e".repeat(64),
+    definitionSnapshot,
+    initialState: { running: false, acceptance: true },
+    moduleAbiHashes: {
+      [looperClass]: looperHash,
+      [bodyClass]: bodyHash,
+    },
+    approvals: {},
+  };
+  let completion;
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    if (value.endsWith(callbacks.heartbeat)) return new Response(null, { status: 204 });
+    if (value.endsWith(callbacks.materialize)) {
+      return new Response(JSON.stringify(materialization), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.endsWith(callbacks.complete)) {
+      completion = JSON.parse(options.body);
+      return new Response(JSON.stringify({ accepted: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return fetch(url, options);
+  };
+
+  const result = await withRuntimeDiagnostics(() => executeWorkflowRuntimeCommand({
+    agent,
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "private-test-session",
+    fetchImpl,
+    wire: {
+      action: WORKFLOW_ENGINE_ACTION,
+      commandId: "engine-terminal-control-e2e",
+      trace: { traceId: "workflow-engine-terminal-control-e2e" },
+      command: {
+        scope: {},
+        payload: {
+          workflowExecutionId,
+          workflowRunnerId,
+          leaseFence: 11,
+          logicalIdempotencyKey,
+          workflowVersionId,
+          definitionSnapshotHash,
+          callbacks,
+        },
+      },
+    },
+  }), () => runtimeLog);
+
+  assert.equal(result.executed, true);
+  assert.equal(completion.terminalState, "SUCCESS");
+  assert.equal(completion.finalState.running, false);
+  assert.equal(completion.finalState.loopCompleted, true);
+  assert.equal(completion.finalState.bodyExecuted, undefined);
+  assert.equal(
+    Object.values(completion.finalState)
+      .some((value) => String(value).startsWith("workflow-terminal:")),
+    false,
+  );
+  assert.doesNotMatch(runtimeLog, /Maximum workflow task executions exceeded/);
   assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
 });

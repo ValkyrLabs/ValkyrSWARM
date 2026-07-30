@@ -9,7 +9,12 @@ const GRAYMATTER_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_REPLAY_DIR = path.join(os.homedir(), ".config", "valkyr-swarm", "graymatter-replay");
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const SENSITIVE_KEY = /(authorization|bearer|cookie|credential|password|private.?key|secret|token|api.?key)/i;
-const PROTECTED_ACTIONS = new Set(["outbound.send", "production.deploy", "merge"]);
+const PROTECTED_ACTIONS = new Set([
+  "outbound.send",
+  "production.deploy",
+  "merge",
+  "service.lifecycle.restart",
+]);
 const CANONICAL_APPROVAL_REF = /^gm_approval_[0-9a-f]{64}$/;
 
 function boundedText(value, max = MAX_MEMORY_TEXT_CHARS) {
@@ -153,10 +158,35 @@ function commandReceiptText({ agent, wire, response }) {
     type: response.type,
     reason: response.reason ?? null,
     result: compactCommandResult(response.result),
+    contextPageRef: commandTraceRef(wire, "contextPageRef"),
+    retrievalReceiptRef: commandTraceRef(wire, "retrievalReceiptRef"),
+    trajectoryRef: commandTraceRef(wire, "trajectoryRef"),
+    skillOptReceiptRef: commandTraceRef(wire, "skillOptReceiptRef"),
+    workflowExecutionRef: commandTraceRef(wire, "workflowExecutionRef"),
+    capabilityGrantRef: commandTraceRef(wire, "capabilityGrantRef"),
+    policyReceiptRef: commandTraceRef(wire, "policyReceiptRef"),
+    bifrostChainRef: commandTraceRef(wire, "bifrostChainRef"),
+    bifrostChainHash: commandTraceRef(wire, "bifrostChainHash"),
+    bifrostComplete: wire.trace?.bifrostComplete === true
+      || wire.command?.bifrostComplete === true,
+    swarmReceiptRef: commandTraceRef(wire, "receiptRef")
+      ?? safeReceiptRef(wire.receiptRef),
     protectedAction,
     approvalRef: protectedAction && CANONICAL_APPROVAL_REF.test(approvalRef) ? approvalRef : null,
     recordedAt: new Date().toISOString(),
   });
+}
+
+function commandTraceRef(wire, key) {
+  const value = wire?.trace?.[key] ?? wire?.command?.[key];
+  return safeReceiptRef(value);
+}
+
+function safeReceiptRef(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return null;
+  const text = String(value).trim();
+  if (text.length > 256 || !/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(text)) return null;
+  return redactText(text, 256) === text ? text : null;
 }
 
 function compactCommandResult(result) {
@@ -177,8 +207,46 @@ function compactCommandResult(result) {
     "checkpointRef",
     "grayMatterReceiptRef",
     "grayMatterReceiptStatus",
+    "pendingRecovery",
+    "serviceHandle",
+    "supervisor",
   ]) {
     if (result[key] !== undefined) compact[key] = result[key];
+  }
+  if (result.service && typeof result.service === "object" && !Array.isArray(result.service)) {
+    compact.service = Object.fromEntries(
+      [
+        "displayName",
+        "expectedAgentId",
+        "handle",
+        "installed",
+        "kind",
+        "restartable",
+        "running",
+        "selfRestart",
+        "sharedBridge",
+        "state",
+        "supervisor",
+      ]
+        .filter((key) => result.service[key] !== undefined)
+        .map((key) => [key, redactStructured(result.service[key], key)]),
+    );
+  }
+  if (result.proof && typeof result.proof === "object" && !Array.isArray(result.proof)) {
+    compact.proof = Object.fromEntries(
+      [
+        "capabilities",
+        "expectedAgentId",
+        "handle",
+        "healthy",
+        "heartbeatAt",
+        "heartbeatFresh",
+        "supervisorRunning",
+        "version",
+      ]
+        .filter((key) => result.proof[key] !== undefined)
+        .map((key) => [key, redactStructured(result.proof[key], key)]),
+    );
   }
   if (result.artifact && typeof result.artifact === "object") {
     const artifact = { eventCount: result.artifact.eventCount ?? null };

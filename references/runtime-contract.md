@@ -6,6 +6,17 @@
 - Agent configuration contains stable machine/runtime identifiers and private credential-file references, never caller-supplied tenant identity.
 - Every command targets one exact registered instance and one advertised capability or supported tool.
 
+## Governed native service lifecycle
+
+- `service.lifecycle.status` is bounded, read-only inspection. `service.lifecycle.restart` is protected and requires the mothership-injected content-bound `gm_approval_...` reference for the exact target agent, expected machine, and semantic service handle.
+- A node advertises status only when it discovers at least one installed canonical launchd or user-systemd binding. It advertises restart only when at least one discovered binding is restartable. Configuration text, chat instructions, or a caller-supplied label never create either capability.
+- The only semantic handles are `codex`, `openclaw`, `valoride`, `swarm-bridge`, `workflow-runner`, `workflow-engine`, and `claude-code`. Handles resolve locally to deterministic node-owned definitions; the wire contract accepts no process, executable, supervisor label, filesystem path, shell, argument, environment, or sudo material.
+- A `valoride` handle controls only a canonically supervised ValorIDE SWARM bridge/runner. It does not imply desktop application UI health and must never kill or relaunch an arbitrary GUI process.
+- Ordinary Claude Code CLI sessions are interactive bounded sessions, not services. `claude-code` is advertised only when an explicit canonical supervised Claude Code bridge definition exists; otherwise launch a new bounded task through the existing runtime adapter.
+- Status and restart reject missing targets, host mismatches, missing services, undeclared capabilities, unsupported supervisors, and malformed or injected payload fields. Native supervisor execution uses fixed argument arrays without shell interpolation or privilege escalation.
+- Accepted delivery is not completion. The runtime emits started/progress and terminal completed/failed frames; completion requires supervisor health plus a fresh expected agent heartbeat, version, capabilities, and terminal GrayMatter receipt.
+- Restarting the shared SWARM bridge, including its supervised Codex, OpenClaw, or ValorIDE projection, writes a private durable pending-recovery record before invoking the native supervisor. The reconnected bridge reconciles that record and emits terminal proof. A separately supervised Workflow runner or engine is verified synchronously by its healthy peer bridge.
+
 ## Advertised Workflow capability tiers
 
 - `workflow.runner.execute-module` is the constrained stateless tier for one remote-safe ExecModule invocation.
@@ -49,4 +60,4 @@
 
 ## Approval
 
-Capability is not authorization. Outbound sends, production deployments, merges, and financial, legal, personnel, destructive, irreversible, security-sensitive, or material-spend effects continue through ValkyrAI's canonical correlated human-approval control plane.
+Capability is not authorization. Outbound sends, production deployments, merges, supervised service restarts, and financial, legal, personnel, destructive, irreversible, security-sensitive, or material-spend effects continue through ValkyrAI's canonical correlated human-approval control plane.

@@ -28,13 +28,18 @@ test("MCP initialize and tool discovery expose the bounded SWARM surface", async
   const client = {};
   const initialized = await handleMessage({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, client);
   assert.equal(initialized.result.serverInfo.name, "valkyr-swarm");
-  assert.equal(initialized.result.serverInfo.version, "0.4.1");
+  assert.equal(initialized.result.serverInfo.version, "0.4.2");
   const listed = await handleMessage({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, client);
   assert.deepEqual(listed.result.tools.map((tool) => tool.name), TOOLS.map((tool) => tool.name));
 });
 
 test("protected dispatch fails closed without a human approval receipt", async () => {
-  assert.deepEqual([...PROTECTED_ACTIONS].sort(), ["merge", "outbound.send", "production.deploy"]);
+  assert.deepEqual([...PROTECTED_ACTIONS].sort(), [
+    "merge",
+    "outbound.send",
+    "production.deploy",
+    "service.lifecycle.restart",
+  ]);
   const client = new ValkyrSwarmClient({ env: { VALKYR_AUTH_TOKEN: "test-token" } });
   await assert.rejects(
     client.dispatch({ targetAgentId: "builder", action: "merge", instruction: "Merge it" }),

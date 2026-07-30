@@ -12,7 +12,12 @@ import {
   parseServerControlReply,
   validateConfig,
 } from "../scripts/swarm-agent.mjs";
-import { forbiddenConfigPaths, readReceiptEvidence } from "../scripts/swarm-doctor.mjs";
+import {
+  forbiddenConfigPaths,
+  readReceiptEvidence,
+  registeredAgentEvidence,
+  tenantWorkflowCapabilityEvidence,
+} from "../scripts/swarm-doctor.mjs";
 
 test("runtime accepts only exact targets and advertised capabilities", () => {
   const agent = { agentId: "codex-host", capabilities: ["workflow.debug"] };
@@ -133,4 +138,86 @@ test("doctor detects forbidden identity fields and secret-bearing receipts", () 
   fs.appendFileSync(receipt, `${JSON.stringify({ event: "bad", value: "Bearer eyJabcdefgh.ijklmnop.qrstuvwx" })}\n`);
   assert.equal(readReceiptEvidence(receipt, ["codex-host"]).secretSafe, false);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("doctor proves the mothership received the exact configured Workflow tier", () => {
+  const configured = [{
+    agentId: "codex-engine",
+    runtime: "codex",
+    workflowRuntime: { enabled: true, tier: "engine" },
+  }];
+  const manifestHash = "a".repeat(64);
+  const registered = registeredAgentEvidence(configured, {
+    "codex-engine": {
+      status: "healthy",
+      runtime: "codex",
+      lastSeen: "2026-07-29T14:00:00Z",
+      supportedTools: [
+        "workflow.engine.execute-workflow",
+        "workflow.engine.kill-execution",
+      ],
+      capabilities: [
+        `execmodule-abi:${"b".repeat(64)}`,
+        "workflow-pack:core-transforms:1",
+        "workflow-pack:engineering-project:1.0.0",
+      ],
+      workflowRuntime: {
+        installed: true,
+        healthy: true,
+        status: "healthy",
+        protocol: "valkyr-workflow-engine/v1",
+        moduleAbiCount: 21,
+        capabilityPackCount: 2,
+        capabilityPackManifestHash: manifestHash,
+      },
+    },
+  });
+
+  assert.equal(registered[0].expectedWorkflowTool, "workflow.engine.execute-workflow");
+  assert.equal(registered[0].workflowCapabilityAdvertised, true);
+  assert.deepEqual(registered[0].workflowRuntime.capabilityPacks, [
+    "workflow-pack:core-transforms:1",
+    "workflow-pack:engineering-project:1.0.0",
+  ]);
+  assert.equal(registered[0].workflowRuntime.capabilityPackManifestHash, manifestHash);
+  assert.deepEqual(tenantWorkflowCapabilityEvidence(registered), {
+    requiredAgents: 1,
+    ready: true,
+    registered: [{
+      agentId: "codex-engine",
+      expectedWorkflowTool: "workflow.engine.execute-workflow",
+      supportedTools: [
+        "workflow.engine.execute-workflow",
+        "workflow.engine.kill-execution",
+      ],
+      workflowCapabilityAdvertised: true,
+      workflowRuntime: registered[0].workflowRuntime,
+    }],
+  });
+});
+
+test("doctor fails the Workflow capability gate when the sidecar was not advertised", () => {
+  const configured = [{
+    agentId: "valor-runner",
+    runtime: "valoride",
+    workflowRuntime: { enabled: true, tier: "runner" },
+  }];
+  const registered = registeredAgentEvidence(configured, {
+    "valor-runner": {
+      status: "healthy",
+      runtime: "valoride",
+      supportedTools: [],
+      capabilities: ["java:17"],
+      workflowRuntime: {
+        installed: true,
+        healthy: true,
+        status: "healthy",
+        protocol: "valkyr-workflow-runner/v1",
+      },
+    },
+  });
+
+  assert.equal(registered[0].expectedWorkflowTool, "workflow.runner.execute-module");
+  assert.equal(registered[0].workflowCapabilityAdvertised, false);
+  assert.equal(tenantWorkflowCapabilityEvidence(registered).ready, false);
 });
