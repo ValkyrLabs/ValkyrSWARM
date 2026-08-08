@@ -194,10 +194,19 @@ function compactCommandResult(result) {
   const compact = {};
   for (const key of [
     "adapter",
+    "actionDigest",
+    "attempted",
+    "checkpoint",
     "executed",
+    "executionState",
+    "journalPersisted",
+    "journalState",
+    "quarantined",
     "receiptOnly",
+    "replayed",
     "runtimeAgentId",
     "sessionKey",
+    "scopeDigest",
     "status",
     "workflowRunId",
     "workflowExecutionId",
@@ -212,6 +221,9 @@ function compactCommandResult(result) {
     "supervisor",
   ]) {
     if (result[key] !== undefined) compact[key] = result[key];
+  }
+  if (result.outcome && typeof result.outcome === "object" && !Array.isArray(result.outcome)) {
+    compact.outcome = redactStructured(result.outcome);
   }
   if (result.service && typeof result.service === "object" && !Array.isArray(result.service)) {
     compact.service = Object.fromEntries(

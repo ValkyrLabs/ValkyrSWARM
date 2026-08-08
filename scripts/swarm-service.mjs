@@ -14,6 +14,7 @@ const LABEL_PREFIX = "com.valkyrlabs.swarm";
 const SERVICE_RUNTIME_FILES = Object.freeze([
   "swarm-agent.mjs",
   "swarm-auth.mjs",
+  "swarm-command-journal.mjs",
   "swarm-graymatter.mjs",
   "swarm-runtime-adapters.mjs",
   "swarm-service-lifecycle.mjs",

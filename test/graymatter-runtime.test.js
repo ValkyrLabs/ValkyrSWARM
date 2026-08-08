@@ -261,13 +261,37 @@ test("credit-gated receipts enter a private replay queue and later persist", asy
       apiBase: "https://api-0.valkyrlabs.com/v1",
       tokenProvider: async () => "test-token",
       wire: { action: "workflow.debug", commandId: "cmd-credit", trace: { traceId: "trace-credit" } },
-      response: { type: "ACK", status: "completed", result: { executed: true } },
+      response: {
+        type: "ACK",
+        status: "completed",
+        result: {
+          attempted: true,
+          executed: true,
+          actionDigest: `sha256:${"a".repeat(64)}`,
+          scopeDigest: `sha256:${"b".repeat(64)}`,
+          outcome: {
+            schemaVersion: "valkyr-swarm-runtime-outcome/v1",
+            status: "SUCCEEDED",
+            commandId: "cmd-credit",
+            actionDigest: `sha256:${"a".repeat(64)}`,
+            targetInstanceId: "codex-host",
+            scopeDigest: `sha256:${"b".repeat(64)}`,
+            summary: "Completed and verified",
+            evidenceRefs: ["test:focused:green"],
+            source: "runtime-envelope",
+            confidence: "EXPLICIT",
+          },
+        },
+      },
       replayDir,
       fetchImpl: async () => new Response(JSON.stringify({ code: "INSUFFICIENT_FUNDS" }), { status: 402 }),
     });
     assert.equal(queued.queued, true);
     assert.equal(fs.statSync(queued.queuePath).mode & 0o077, 0);
-    assert.equal(fs.readFileSync(queued.queuePath, "utf8").includes("test-token"), false);
+    const queuedText = fs.readFileSync(queued.queuePath, "utf8");
+    assert.equal(queuedText.includes("test-token"), false);
+    assert.equal(queuedText.includes("valkyr-swarm-runtime-outcome/v1"), true);
+    assert.equal(queuedText.includes("SUCCEEDED"), true);
 
     const replayed = await replayQueuedReceipts({
       agentId: "codex-host",

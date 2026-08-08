@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valkyrlabs.com/contracts/valkyr-swarm-runtime-outcome.v1.schema.json",
+  "title": "Valkyr SWARM Runtime Outcome v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "status",
+    "commandId",
+    "actionDigest",
+    "targetInstanceId",
+    "scopeDigest",
+    "summary",
+    "evidenceRefs",
+    "source",
+    "confidence"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "valkyr-swarm-runtime-outcome/v1"
+    },
+    "status": {
+      "enum": [
+        "SUCCEEDED",
+        "FAILED",
+        "BLOCKED",
+        "WAITING_APPROVAL",
+        "OUTCOME_UNCERTAIN"
+      ]
+    },
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "actionDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "targetInstanceId": {
+      "type": ["string", "null"]
+    },
+    "scopeDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      }
+    },
+    "source": {
+      "enum": [
+        "runtime-envelope",
+        "legacy-classifier",
+        "adapter-error",
+        "journal-quarantine"
+      ]
+    },
+    "confidence": {
+      "enum": ["EXPLICIT", "INFERRED", "UNRESOLVED"]
+    },
+    "approvalRef": {
+      "type": "string",
+      "pattern": "^gm_approval_[0-9a-f]{64}$"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "outcomeHash": {
+      "type": "string",
+      "pattern": "^(sha256:)?[0-9a-f]{64}$"
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 50
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": { "const": "SUCCEEDED" }
+        }
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "evidenceRefs": { "minItems": 1 }
+            }
+          },
+          {
+            "required": ["outcomeHash"]
+          },
+          {
+            "required": ["evidence"],
+            "properties": {
+              "evidence": { "minItems": 1 }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

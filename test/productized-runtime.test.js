@@ -20,12 +20,15 @@ import {
   buildOpenClawPrompt,
   buildRuntimeInvocation,
   buildRuntimePrompt,
+  classifyLegacyTerminalStatus,
   executeRuntimeCommand,
+  RUNTIME_OUTCOME_SCHEMA,
   runtimeExecutionConfig,
   supervisedRuntimeEnvironment,
   terminalAgentText,
   validateRuntimeAdapter,
 } from "../scripts/swarm-runtime-adapters.mjs";
+import { commandBinding } from "../scripts/swarm-command-journal.mjs";
 
 function fakeSpawn(stdoutText, stderrText = "", exitCode = 0) {
   return () => {
@@ -590,7 +593,7 @@ test("OpenClaw and ValorIDE adapters execute and stream terminal progress", asyn
       },
       action: "market.research",
       output: JSON.stringify({
-        payloads: [{ text: "market result" }],
+        payloads: [{ text: "Market research completed successfully." }],
         meta: { transport: "gateway", runId: "run-openclaw" },
       }),
       adapter: "openclaw-agent",
@@ -633,6 +636,142 @@ test("OpenClaw and ValorIDE adapters execute and stream terminal progress", asyn
     assert.equal(progress.length, 1);
     assert.equal(progress[0].stream, "stdout");
   }
+});
+
+test("exit zero is transport-only and blocked legacy prose cannot become success", async () => {
+  const result = await executeRuntimeCommand({
+    agent: {
+      agentId: "valoride-builder",
+      runtime: "valoride",
+      execution: {
+        adapter: "valoride-cli",
+        agentId: "valoride-builder",
+        executable: "/bin/valoride",
+        timeoutSeconds: 30,
+        workingDirectory: "/tmp",
+      },
+    },
+    wire: {
+      action: "cms.write",
+      commandId: "cmd-false-success",
+      targetInstanceId: "valoride-builder",
+      command: { data: { objective: "Create the page" }, scope: { siteId: "site-1" } },
+      trace: { traceId: "trace-false-success" },
+    },
+    spawnImpl: fakeSpawn("Blocked: the CMS credential is unavailable, so no page was created.\n", "", 0),
+  });
+
+  assert.equal(result.attempted, true);
+  assert.equal(result.executed, false);
+  assert.equal(result.status, "blocked");
+  assert.equal(result.outcome.schemaVersion, RUNTIME_OUTCOME_SCHEMA);
+  assert.equal(result.outcome.status, "BLOCKED");
+  assert.equal(result.outcome.source, "legacy-classifier");
+  assert.equal(classifyLegacyTerminalStatus("implemented and verified"), "SUCCEEDED");
+  assert.equal(classifyLegacyTerminalStatus("market result"), "OUTCOME_UNCERTAIN");
+});
+
+test("ValorIDE terminal envelopes normalize without losing binding evidence", async () => {
+  const wire = {
+    action: "code.execute",
+    commandId: "cmd-valor-envelope",
+    targetInstanceId: "valoride-builder",
+    command: {
+      data: { objective: "Implement the bounded change" },
+      scope: { workspace: "/tmp/project" },
+    },
+    trace: { traceId: "trace-valor-envelope" },
+  };
+  const binding = commandBinding(wire);
+  wire.command.actionDigest = binding.actionDigest;
+  wire.command.scopeDigest = binding.scopeDigest;
+  const outcomeHash = "a".repeat(64);
+  const legacyValorEnvelope = {
+    schemaVersion: "valoride.swarm.terminal-outcome/1.0",
+    status: "SUCCEEDED",
+    commandId: wire.commandId,
+    actionDigest: binding.actionDigest,
+    targetInstanceId: wire.targetInstanceId,
+    scopeDigest: binding.scopeDigest,
+    summary: "Implemented and verified",
+    evidenceRefs: ["test:focused:green"],
+    outcomeHash,
+  };
+  const output = JSON.stringify({
+    type: "item.completed",
+    item: {
+      type: "agent_message",
+      text: `Bounded implementation summary\n${JSON.stringify(legacyValorEnvelope)}`,
+    },
+  });
+  const result = await executeRuntimeCommand({
+    agent: {
+      agentId: "valoride-builder",
+      runtime: "valoride",
+      execution: {
+        adapter: "valoride-cli",
+        agentId: "valoride-builder",
+        executable: "/bin/valoride",
+        timeoutSeconds: 30,
+        workingDirectory: "/tmp",
+      },
+    },
+    wire,
+    spawnImpl: fakeSpawn(`${output}\n`),
+  });
+
+  assert.equal(result.executed, true);
+  assert.equal(result.outcome.schemaVersion, RUNTIME_OUTCOME_SCHEMA);
+  assert.equal(result.outcome.commandId, wire.commandId);
+  assert.equal(result.outcome.actionDigest, binding.actionDigest);
+  assert.equal(result.outcome.scopeDigest, binding.scopeDigest);
+  assert.equal(result.outcome.outcomeHash, outcomeHash);
+  assert.deepEqual(result.outcome.evidenceRefs, ["test:focused:green"]);
+  assert.equal(result.outcome.metadata.sourceSchemaVersion,
+    "valoride.swarm.terminal-outcome/1.0");
+
+  const { outcomeHash: _ignoredOutcomeHash, ...evidenceFreeEnvelope } = legacyValorEnvelope;
+  evidenceFreeEnvelope.evidenceRefs = [];
+  const unproven = await executeRuntimeCommand({
+    agent: {
+      agentId: "valoride-builder",
+      runtime: "valoride",
+      execution: {
+        adapter: "valoride-cli",
+        agentId: "valoride-builder",
+        executable: "/bin/valoride",
+        timeoutSeconds: 30,
+        workingDirectory: "/tmp",
+      },
+    },
+    wire,
+    spawnImpl: fakeSpawn(`${JSON.stringify(evidenceFreeEnvelope)}\n`),
+  });
+  assert.equal(unproven.executed, false);
+  assert.equal(unproven.outcome.status, "OUTCOME_UNCERTAIN");
+
+  const nonCanonicalStatus = {
+    ...legacyValorEnvelope,
+    schemaVersion: RUNTIME_OUTCOME_SCHEMA,
+    status: "completed",
+  };
+  const invalidStatus = await executeRuntimeCommand({
+    agent: {
+      agentId: "valoride-builder",
+      runtime: "valoride",
+      execution: {
+        adapter: "valoride-cli",
+        agentId: "valoride-builder",
+        executable: "/bin/valoride",
+        timeoutSeconds: 30,
+        workingDirectory: "/tmp",
+      },
+    },
+    wire,
+    spawnImpl: fakeSpawn(`${JSON.stringify(nonCanonicalStatus)}\n`),
+  });
+  assert.equal(invalidStatus.executed, false);
+  assert.equal(invalidStatus.outcome.status, "OUTCOME_UNCERTAIN");
 });
 
 test("ValorIDE starts a fresh task instead of attaching to a nonexistent session", () => {

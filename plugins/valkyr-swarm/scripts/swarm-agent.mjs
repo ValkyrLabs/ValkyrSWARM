@@ -12,6 +12,11 @@ import {
   validateRuntimeAdapter,
 } from "./swarm-runtime-adapters.mjs";
 import {
+  CommandOutcomeJournal,
+  RUNTIME_OUTCOME_SCHEMA,
+  commandBinding,
+} from "./swarm-command-journal.mjs";
+import {
   credentialsFromSecureStorage,
   expandPath,
   keychainRead,
@@ -56,6 +61,13 @@ const MAX_IDENTIFIER_LENGTH = 160;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
 const CANONICAL_APPROVAL_REF = /^gm_approval_[0-9a-f]{64}$/;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
+const TERMINAL_OUTCOME_STATUSES = new Set([
+  "SUCCEEDED",
+  "FAILED",
+  "BLOCKED",
+  "WAITING_APPROVAL",
+  "OUTCOME_UNCERTAIN",
+]);
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
@@ -355,6 +367,155 @@ function workflowEngineLifecycleResponse(event, context = {}) {
   };
 }
 
+function runtimeTerminalResponse(result, wire = null) {
+  let boundedResult = result && typeof result === "object" ? result : {};
+  if (wire) {
+    const binding = commandBinding(wire);
+    const candidate = boundedResult.outcome;
+    const status = String(candidate?.status ?? "");
+    const hasSuccessEvidence = status !== "SUCCEEDED"
+      || (Array.isArray(candidate?.evidenceRefs)
+        && candidate.evidenceRefs.some((item) => typeof item === "string" && item.trim()))
+      || (Array.isArray(candidate?.evidence) && candidate.evidence.length > 0)
+      || (typeof candidate?.outcomeHash === "string"
+        && /^(?:sha256:)?[0-9a-f]{64}$/i.test(candidate.outcomeHash));
+    const bindingMatches = candidate?.schemaVersion === RUNTIME_OUTCOME_SCHEMA
+      && TERMINAL_OUTCOME_STATUSES.has(status)
+      && hasSuccessEvidence
+      && candidate?.commandId === binding.commandId
+      && candidate?.actionDigest === binding.actionDigest
+      && (candidate?.targetInstanceId ?? null) === binding.targetInstanceId
+      && candidate?.scopeDigest === binding.scopeDigest
+      && (!candidate?.approvalRef || candidate.approvalRef === binding.approvalRef);
+    if (!bindingMatches) {
+      const outcome = governedOutcome(wire, {
+        status: "OUTCOME_UNCERTAIN",
+        summary: "The runtime result was missing or mismatched the dispatched terminal outcome binding",
+        source: "runtime-envelope",
+        confidence: "UNRESOLVED",
+        retryable: false,
+      });
+      boundedResult = {
+        ...boundedResult,
+        executed: false,
+        actionDigest: outcome.actionDigest,
+        scopeDigest: outcome.scopeDigest,
+        outcome,
+      };
+    }
+  }
+  const outcomeStatus = String(boundedResult?.outcome?.status ?? "OUTCOME_UNCERTAIN").toUpperCase();
+  const resultWithCheckpoint = outcomeStatus === "WAITING_APPROVAL"
+    ? {
+        ...boundedResult,
+        executed: false,
+        checkpoint: true,
+        executionState: "WAITING_APPROVAL",
+      }
+    : boundedResult;
+  if (outcomeStatus === "SUCCEEDED") {
+    return { type: "ACK", status: "completed", result: resultWithCheckpoint };
+  }
+  if (outcomeStatus === "WAITING_APPROVAL") {
+    return { type: "ACK", status: "progress", result: resultWithCheckpoint };
+  }
+  if (outcomeStatus === "BLOCKED") {
+    return {
+      type: "NACK",
+      status: "blocked",
+      reason: redactedText(result?.outcome?.summary ?? "Runtime reported a blocked outcome"),
+      result: resultWithCheckpoint,
+    };
+  }
+  return {
+    type: "NACK",
+    status: "failed",
+    reason: redactedText(result?.outcome?.summary ?? "Runtime outcome could not be proven"),
+    result: resultWithCheckpoint,
+  };
+}
+
+function journalTerminalState(response) {
+  const outcomeStatus = String(response?.result?.outcome?.status ?? "").toUpperCase();
+  if (outcomeStatus === "WAITING_APPROVAL") return "CHECKPOINTED";
+  if (outcomeStatus === "OUTCOME_UNCERTAIN") return "OUTCOME_UNCERTAIN";
+  return "TERMINAL";
+}
+
+function governedOutcome(wire, {
+  status,
+  summary,
+  source,
+  confidence = "EXPLICIT",
+  retryable = false,
+}) {
+  const binding = commandBinding(wire);
+  return {
+    schemaVersion: RUNTIME_OUTCOME_SCHEMA,
+    status,
+    commandId: binding.commandId,
+    actionDigest: binding.actionDigest,
+    targetInstanceId: binding.targetInstanceId,
+    scopeDigest: binding.scopeDigest,
+    summary: redactedText(summary),
+    evidenceRefs: [],
+    source,
+    confidence,
+    ...(binding.approvalRef ? { approvalRef: binding.approvalRef } : {}),
+    retryable,
+  };
+}
+
+function journalQuarantineResponse(wire, adapter) {
+  const outcome = governedOutcome(wire, {
+    status: "OUTCOME_UNCERTAIN",
+    summary: "A prior protected or non-idempotent execution started without durable terminal proof; the command was quarantined instead of respawned",
+    source: "journal-quarantine",
+    confidence: "UNRESOLVED",
+    retryable: false,
+  });
+  return {
+    type: "NACK",
+    status: "failed",
+    reason: "ambiguous_started_effect_quarantined",
+    result: {
+      adapter,
+      attempted: true,
+      executed: false,
+      receiptOnly: false,
+      actionDigest: outcome.actionDigest,
+      scopeDigest: outcome.scopeDigest,
+      outcome,
+      journalState: "OUTCOME_UNCERTAIN",
+      quarantined: true,
+    },
+  };
+}
+
+function adapterErrorResponse(wire, adapter, error) {
+  const reason = redactedError(error);
+  const outcome = governedOutcome(wire, {
+    status: "FAILED",
+    summary: reason,
+    source: "adapter-error",
+    retryable: true,
+  });
+  return {
+    type: "NACK",
+    status: "failed",
+    reason,
+    result: {
+      adapter,
+      attempted: true,
+      executed: false,
+      receiptOnly: false,
+      actionDigest: outcome.actionDigest,
+      scopeDigest: outcome.scopeDigest,
+      outcome,
+    },
+  };
+}
+
 class EvidenceLog {
   constructor(receiptPath) {
     this.path = receiptPath ? expandPath(receiptPath) : null;
@@ -382,6 +543,9 @@ class SwarmAgent {
     heartbeatSeconds,
     evidence,
     recoveryRoot = DEFAULT_RECOVERY_ROOT,
+    commandJournal,
+    commandJournalRoot,
+    runtimeExecutor = executeRuntimeCommand,
   }) {
     this.agent = agent;
     this.apiBase = apiBase;
@@ -408,6 +572,13 @@ class SwarmAgent {
     this.workflowEngineReplayActive = false;
     this.lastGrayMatterReplayAt = 0;
     this.recoveryRoot = recoveryRoot;
+    this.runtimeExecutor = runtimeExecutor;
+    this.commandJournal = commandJournal ?? (agent.execution
+      ? new CommandOutcomeJournal({
+          agentId: agent.agentId,
+          ...(commandJournalRoot ? { root: commandJournalRoot } : {}),
+        })
+      : null);
     this.serviceLifecycleState = buildServiceLifecycleState({
       agent: this.agent,
       machineId: this.machineId,
@@ -1055,26 +1226,6 @@ class SwarmAgent {
       return;
     }
 
-    const prior = this.completedCommands.get(wire.commandId);
-    if (prior) {
-      this.sendCommandResponse(wire, prior);
-      this.evidence.record("command_replayed", {
-        action: wire.action,
-        agentId: this.agent.agentId,
-        commandId: wire.commandId,
-        status: prior.status,
-      });
-      return;
-    }
-    if (this.inFlightCommands.has(wire.commandId)) {
-      this.sendCommandResponse(wire, {
-        type: "ACK",
-        status: "started",
-        result: { executed: false, receiptOnly: false, reused: true },
-      });
-      return;
-    }
-
     if (route.disposition === "reject") {
       const rejected = {
         type: "NACK",
@@ -1101,6 +1252,33 @@ class SwarmAgent {
       .includes(wire.action);
     const workflowRuntime = supportsWorkflowRuntimeAction(
       this.agent, this.workflowRuntimeState, wire.action);
+    const ordinaryRuntime = Boolean(this.agent.execution) && !workflowRuntime && !serviceLifecycle;
+    const adapter = serviceLifecycle
+      ? "native-service-lifecycle"
+      : workflowRuntime ? "workflow-runtime-http" : this.agent.execution?.adapter;
+
+    if (!ordinaryRuntime) {
+      const prior = this.completedCommands.get(wire.commandId);
+      if (prior) {
+        this.sendCommandResponse(wire, prior);
+        this.evidence.record("command_replayed", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          status: prior.status,
+        });
+        return;
+      }
+      if (this.inFlightCommands.has(wire.commandId)) {
+        this.sendCommandResponse(wire, {
+          type: "ACK",
+          status: "started",
+          result: { executed: false, receiptOnly: false, reused: true },
+        });
+        return;
+      }
+    }
+
     if (!this.agent.execution && !workflowRuntime && !serviceLifecycle) {
       const received = {
         type: "ACK",
@@ -1121,9 +1299,148 @@ class SwarmAgent {
       return;
     }
 
-    const adapter = serviceLifecycle
-      ? "native-service-lifecycle"
-      : workflowRuntime ? "workflow-runtime-http" : this.agent.execution?.adapter;
+    if (ordinaryRuntime) {
+      let journalInspection;
+      try {
+        journalInspection = this.commandJournal.inspect(wire, {
+          protectedAction: route.protectedAction,
+        });
+      } catch (error) {
+        const failed = adapterErrorResponse(wire, adapter, error);
+        failed.reason = "command_journal_unavailable";
+        failed.result.outcome = governedOutcome(wire, {
+          status: "FAILED",
+          summary: "The node-local command journal was unavailable before execution; no runtime was spawned",
+          source: "journal-quarantine",
+          retryable: true,
+        });
+        this.sendCommandResponse(wire, failed);
+        void this.persistTerminalReceipt(wire, failed);
+        this.evidence.record("command_journal_failed_closed", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          error: redactedError(error),
+          phase: "inspect",
+        });
+        return;
+      }
+      if (journalInspection.decision === "DIGEST_MISMATCH") {
+        const rejected = {
+          type: "NACK",
+          status: "rejected",
+          reason: "command_id_action_digest_mismatch",
+          result: {
+            adapter,
+            executed: false,
+            receiptOnly: true,
+            actionDigest: journalInspection.binding.actionDigest,
+            scopeDigest: journalInspection.binding.scopeDigest,
+          },
+        };
+        this.sendCommandResponse(wire, rejected);
+        void this.persistTerminalReceipt(wire, rejected);
+        this.evidence.record("command_digest_mismatch_rejected", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          targetInstanceId: wire.targetInstanceId,
+        });
+        return;
+      }
+      if (this.inFlightCommands.has(wire.commandId)) {
+        this.sendCommandResponse(wire, {
+          type: "ACK",
+          status: "started",
+          result: {
+            adapter,
+            executed: false,
+            receiptOnly: false,
+            reused: true,
+            actionDigest: journalInspection.binding.actionDigest,
+            scopeDigest: journalInspection.binding.scopeDigest,
+          },
+        });
+        return;
+      }
+      if (journalInspection.decision === "REPLAY_TERMINAL") {
+        const replay = {
+          ...journalInspection.response,
+          result: {
+            ...journalInspection.response.result,
+            replayed: true,
+            journalState: journalInspection.record.state,
+          },
+        };
+        this.rememberCompleted(wire.commandId, replay);
+        this.sendCommandResponse(wire, replay);
+        this.evidence.record("command_journal_replayed", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          journalState: journalInspection.record.state,
+          status: replay.status,
+        });
+        return;
+      }
+      if (journalInspection.decision === "QUARANTINE_UNCERTAIN") {
+        const quarantined = journalQuarantineResponse(wire, adapter);
+        try {
+          this.commandJournal.markTerminal(wire, quarantined, {
+            state: "OUTCOME_UNCERTAIN",
+            protectedAction: route.protectedAction,
+          });
+        } catch (error) {
+          quarantined.result.journalPersisted = false;
+          quarantined.result.journalError = redactedError(error);
+        }
+        const projection = this.persistTerminalReceipt(wire, quarantined).then((memoryReceipt) => {
+          quarantined.result.grayMatterReceiptRef = memoryReceipt.id
+            ? `MemoryEntry:${memoryReceipt.id}` : null;
+          quarantined.result.grayMatterReceiptStatus = memoryReceipt.status;
+          this.rememberCompleted(wire.commandId, quarantined);
+          this.sendCommandResponse(wire, quarantined);
+        });
+        this.inFlightCommands.set(wire.commandId, projection.finally(
+          () => this.inFlightCommands.delete(wire.commandId),
+        ));
+        this.evidence.record("command_effect_quarantined", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          protectedAction: route.protectedAction,
+        });
+        return;
+      }
+      try {
+        const started = this.commandJournal.markStarted(wire, {
+          protectedAction: route.protectedAction,
+        });
+        if (!["NEW", "RESUME_SAFE"].includes(started.decision)) {
+          throw new Error(`Unexpected command journal decision ${started.decision}`);
+        }
+      } catch (error) {
+        const failed = adapterErrorResponse(wire, adapter, error);
+        failed.reason = "command_journal_start_failed";
+        failed.result.outcome = governedOutcome(wire, {
+          status: "FAILED",
+          summary: "The node-local command start proof could not be persisted; no runtime was spawned",
+          source: "journal-quarantine",
+          retryable: true,
+        });
+        this.sendCommandResponse(wire, failed);
+        void this.persistTerminalReceipt(wire, failed);
+        this.evidence.record("command_journal_failed_closed", {
+          action: wire.action,
+          agentId: this.agent.agentId,
+          commandId: wire.commandId,
+          error: redactedError(error),
+          phase: "mark_started",
+        });
+        return;
+      }
+    }
+
     this.sendCommandResponse(wire, {
       type: "ACK",
       status: "started",
@@ -1131,6 +1448,11 @@ class SwarmAgent {
         adapter,
         executed: false,
         receiptOnly: false,
+        ...(ordinaryRuntime ? {
+          actionDigest: commandBinding(wire).actionDigest,
+          scopeDigest: commandBinding(wire).scopeDigest,
+          journalState: "STARTED",
+        } : {}),
       },
     });
     this.evidence.record("command_started", {
@@ -1164,8 +1486,9 @@ class SwarmAgent {
           traceId: wire.trace?.traceId,
         });
       };
-    const execution = (serviceLifecycle
-      ? executeServiceLifecycleCommand({
+    const execution = Promise.resolve()
+      .then(() => (serviceLifecycle
+        ? executeServiceLifecycleCommand({
           agent: this.agent,
           machineId: this.machineId,
           onProgress,
@@ -1174,14 +1497,14 @@ class SwarmAgent {
           verifyRecovery: (binding) => this.verifyServiceRecovery(binding),
           wire,
         })
-      : workflowRuntime ? executeWorkflowRuntimeCommand({
+        : workflowRuntime ? executeWorkflowRuntimeCommand({
           agent: this.agent,
           wire,
           apiBase: this.apiBase,
           tokenProvider: this.tokenProvider,
           onProgress,
         })
-      : executeRuntimeCommand({ agent: this.agent, wire, onProgress }))
+        : this.runtimeExecutor({ agent: this.agent, wire, onProgress })))
       .then(async (result) => {
         if (result?.pendingRecovery === true) {
           const pending = {
@@ -1224,38 +1547,108 @@ class SwarmAgent {
           });
           return;
         }
-        const completed = { type: "ACK", status: "completed", result };
-        const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
-        completed.result = {
-          ...completed.result,
+        let terminal = ordinaryRuntime
+          ? runtimeTerminalResponse(result, wire)
+          : { type: "ACK", status: "completed", result };
+        let journalProofPersisted = false;
+        if (ordinaryRuntime) {
+          try {
+            this.commandJournal.markTerminal(wire, terminal, {
+              state: journalTerminalState(terminal),
+              protectedAction: route.protectedAction,
+            });
+            journalProofPersisted = true;
+          } catch (error) {
+            terminal = journalQuarantineResponse(wire, adapter);
+            terminal.reason = "terminal_proof_persistence_failed";
+            terminal.result.journalPersisted = false;
+            terminal.result.journalError = redactedError(error);
+            this.evidence.record("command_journal_failed_closed", {
+              action: wire.action,
+              agentId: this.agent.agentId,
+              commandId: wire.commandId,
+              error: redactedError(error),
+              phase: "mark_terminal",
+            });
+          }
+        }
+        const memoryReceipt = await this.persistTerminalReceipt(wire, terminal);
+        terminal.result = {
+          ...terminal.result,
           grayMatterReceiptRef: memoryReceipt.id ? `MemoryEntry:${memoryReceipt.id}` : null,
           grayMatterReceiptStatus: memoryReceipt.status,
         };
-        this.rememberCompleted(wire.commandId, completed);
-        this.sendCommandResponse(wire, completed);
-        this.evidence.record("command_completed", {
+        if (ordinaryRuntime && journalProofPersisted) {
+          try {
+            this.commandJournal.markTerminal(wire, terminal, {
+              state: journalTerminalState(terminal),
+              protectedAction: route.protectedAction,
+            });
+          } catch (error) {
+            this.evidence.record("command_journal_projection_update_deferred", {
+              agentId: this.agent.agentId,
+              commandId: wire.commandId,
+              error: redactedError(error),
+            });
+          }
+        }
+        this.rememberCompleted(wire.commandId, terminal);
+        this.sendCommandResponse(wire, terminal);
+        this.evidence.record(terminal.status === "completed"
+          ? "command_completed"
+          : terminal.result?.outcome?.status === "WAITING_APPROVAL"
+            ? "command_checkpointed" : "command_not_completed", {
           action: wire.action,
           adapter: result.adapter,
           agentId: this.agent.agentId,
           commandId: wire.commandId,
-          executed: true,
+          executed: terminal.result?.executed === true,
+          outcomeStatus: terminal.result?.outcome?.status ?? null,
+          status: terminal.status,
           traceId: wire.trace?.traceId,
         });
       })
       .catch(async (error) => {
-        const failed = {
-          type: "NACK",
-          status: "failed",
-          reason: redactedError(error),
-          result: {
-            adapter,
-            executed: false,
-            receiptOnly: false,
-          },
-        };
+        const failed = ordinaryRuntime
+          ? adapterErrorResponse(wire, adapter, error)
+          : {
+              type: "NACK",
+              status: "failed",
+              reason: redactedError(error),
+              result: {
+                adapter,
+                executed: false,
+                receiptOnly: false,
+              },
+            };
+        if (ordinaryRuntime) {
+          try {
+            this.commandJournal.markTerminal(wire, failed, {
+              state: "TERMINAL",
+              protectedAction: route.protectedAction,
+            });
+          } catch (journalError) {
+            failed.result.journalPersisted = false;
+            failed.result.journalError = redactedError(journalError);
+          }
+        }
         const memoryReceipt = await this.persistTerminalReceipt(wire, failed);
         failed.result.grayMatterReceiptRef = memoryReceipt.id ? `MemoryEntry:${memoryReceipt.id}` : null;
         failed.result.grayMatterReceiptStatus = memoryReceipt.status;
+        if (ordinaryRuntime && failed.result.journalPersisted !== false) {
+          try {
+            this.commandJournal.markTerminal(wire, failed, {
+              state: "TERMINAL",
+              protectedAction: route.protectedAction,
+            });
+          } catch (journalError) {
+            this.evidence.record("command_journal_projection_update_deferred", {
+              agentId: this.agent.agentId,
+              commandId: wire.commandId,
+              error: redactedError(journalError),
+            });
+          }
+        }
         this.rememberCompleted(wire.commandId, failed);
         this.sendCommandResponse(wire, failed);
         this.evidence.record("command_failed", {
@@ -1540,6 +1933,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 }
 
 export {
+  SwarmAgent,
+  adapterErrorResponse,
   commandDestinations,
   commandDisposition,
   controlReplyDestination,
@@ -1550,6 +1945,7 @@ export {
   parseWireCommand,
   readKeychainToken,
   redactedError,
+  runtimeTerminalResponse,
   stompFrame,
   validateConfig,
   workflowEngineLifecycleResponse,
