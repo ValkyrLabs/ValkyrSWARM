@@ -19,6 +19,19 @@
 
 ## Advertised Workflow capability tiers
 
+Every executable node registration and heartbeat advertises its canonical
+`workspaceFolders` and `workspaceSummary`. Dispatchers must treat that metadata
+as a routing constraint: an online agent rooted in another workspace is not a
+valid substitute for the requested workspace.
+
+### Versioned node classes
+
+- `valkyr-swarm-node/v1` defines `agentic-runtime` and `model-only`. Nodes that omit the descriptor are treated as agentic only for rolling compatibility; every newly activated local-model node must send it.
+- Agentic runtimes may execute only their explicitly advertised and live-probed native capabilities.
+- Model-only nodes have no native agent execution adapter. They execute only `workflow.engine.execute-workflow` through the durable local engine, plus bounded engine cancellation/approval-denial and discovered service status/protected-restart controls. They fail closed on every arbitrary native capability, including shell, browser, filesystem, messaging, deployment, merge, and agent commands.
+- `valkyr-local-inference-provider/v1` normalizes LM Studio and Ollama behind one explicit loopback endpoint, selected model, and bounded operation set. Provider reachability never grants a capability.
+- ValkyrAI's canonical `ValkyrSwarmExecModule` is the bidirectional workflow boundary: semantic exact-target requests flow to SWARM, while correlated progress, approval waits, artifacts, failures, cancellation, and terminal receipts resume the originating workflow idempotently. It never carries arbitrary executable payloads and does not duplicate the SWARM command bus.
+
 - `workflow.runner.execute-module` is the constrained stateless tier for one remote-safe ExecModule invocation.
 - `workflow.engine.execute-workflow` is the durable tier for one complete immutable Workflow snapshot.
 - The configured tier, release descriptor protocol, loopback health protocol, advertised tool, and capability-pack ABI must agree exactly. A health response from one tier can never promote a node configured for the other tier.

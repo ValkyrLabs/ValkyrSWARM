@@ -25,6 +25,7 @@ import {
   readTokenFile,
 } from "./swarm-auth.mjs";
 import {
+  hydrateRuntimeGrayMatterContext,
   persistCommandReceipt,
   persistWorkflowHandoff,
   replayQueuedReceipts,
@@ -47,6 +48,13 @@ import {
   removePendingRecovery,
   serviceLifecycleAdvertisement,
 } from "./swarm-service-lifecycle.mjs";
+import {
+  constrainNodeAdvertisement,
+  modelOnlyActionAllowed,
+  nodeClass,
+  validateNodeContract,
+} from "./swarm-node-contract.mjs";
+import { probeLocalInferenceProvider } from "./swarm-local-inference-provider.mjs";
 
 const PROTECTED_ACTIONS = new Set([
   "outbound.send",
@@ -302,6 +310,7 @@ function validateConfig(config) {
       throw new Error(`SWARM agent ${agent.agentId} requires capabilities`);
     }
     for (const capability of agent.capabilities) safeIdentifier(capability, `capability for ${agent.agentId}`);
+    validateNodeContract(agent);
     validateRuntimeAdapter(agent);
     validateWorkflowRuntime(agent);
     const capacity = Number(agent.capacity ?? 1);
@@ -315,13 +324,19 @@ function commandDisposition(wire, agent, workflowRuntimeState = agent?.workflowR
   if (!wire.targetInstanceId) return { disposition: "ignore", reason: "missing_target_instance_id" };
   if (wire.targetInstanceId !== agent.agentId) return { disposition: "ignore", reason: "target_mismatch" };
   const action = String(wire.action ?? "").trim();
+  if (nodeClass(agent) === "model-only" && !modelOnlyActionAllowed(action)) {
+    return { disposition: "reject", protectedAction: false, reason: "model_only_action_not_allowed" };
+  }
   if (PROTECTED_ACTIONS.has(action.toLowerCase())) {
     const approvalRef = String(wire.command?.approvalRef ?? "").trim();
     if (!CANONICAL_APPROVAL_REF.test(approvalRef) || wire.command?.requiresApproval !== true) {
       return { disposition: "reject", protectedAction: true, reason: "protected_action_requires_canonical_human_approval" };
     }
   }
-  const advertised = workflowRunnerMetadata(agent, workflowRuntimeState);
+  const advertised = constrainNodeAdvertisement(
+    agent,
+    workflowRunnerMetadata(agent, workflowRuntimeState),
+  );
   const lifecycle = serviceLifecycleAdvertisement(agent, agent?.serviceLifecycleState);
   const supported = new Set([
     ...(advertised.capabilities ?? []),
@@ -463,6 +478,31 @@ function governedOutcome(wire, {
     confidence,
     ...(binding.approvalRef ? { approvalRef: binding.approvalRef } : {}),
     retryable,
+  };
+}
+
+function serviceRecoveryOutcome(wire, {
+  status,
+  summary,
+  retryable = false,
+}) {
+  const outcome = governedOutcome(wire, {
+    status,
+    summary,
+    // Keep the cross-runtime wire vocabulary canonical for api-0. The more
+    // specific native proof provenance remains explicit in metadata and the
+    // lifecycle result's fresh-heartbeat proof object.
+    source: "runtime-envelope",
+    confidence: "EXPLICIT",
+    retryable,
+  });
+  return {
+    ...outcome,
+    evidenceRefs: [`swarm-service-recovery:${wire.commandId}`],
+    metadata: {
+      proofSource: "native-service-lifecycle",
+      proofConfidence: "VERIFIED",
+    },
   };
 }
 
@@ -725,8 +765,23 @@ class SwarmAgent {
     });
   }
 
+  workspaceAdvertisement() {
+    const workspace = String(this.agent.execution?.workingDirectory ?? "").trim();
+    const workspaceFolders = workspace ? [workspace] : [];
+    return {
+      workspaceFolders,
+      workspaceSummary: {
+        folderCount: workspaceFolders.length,
+        folders: workspaceFolders,
+      },
+    };
+  }
+
   sendRegistration() {
-    const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const runner = constrainNodeAdvertisement(
+      this.agent,
+      workflowRunnerMetadata(this.agent, this.workflowRuntimeState),
+    );
     const lifecycle = serviceLifecycleAdvertisement(
       { ...this.agent, capabilities: runner.capabilities },
       this.serviceLifecycleState,
@@ -746,6 +801,7 @@ class SwarmAgent {
         approvalPolicy: "human-approval-required",
         executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
         receiptOnly: !this.agent.execution && !workflowRuntimeReady,
+        ...this.workspaceAdvertisement(),
         version: this.agent.version ?? `valkyr-swarm/${PACKAGE_VERSION}`,
       },
     });
@@ -762,6 +818,28 @@ class SwarmAgent {
 
   async refreshWorkflowRuntime() {
     this.workflowRuntimeState = await probeWorkflowRuntime(this.agent);
+    if (nodeClass(this.agent) === "model-only") {
+      const providerState = await probeLocalInferenceProvider(
+        this.agent.nodeContract.localInferenceProvider,
+      );
+      this.agent.localInferenceProviderState = providerState;
+      if (!providerState.healthy) {
+        this.workflowRuntimeState = {
+          ...this.workflowRuntimeState,
+          healthy: false,
+          status: `local_inference_${providerState.status}`,
+          capabilities: [],
+          supportedTools: [],
+        };
+      }
+      this.evidence.record("local_inference_provider_probe", {
+        agentId: this.agent.agentId,
+        kind: this.agent.nodeContract.localInferenceProvider.kind,
+        model: this.agent.nodeContract.localInferenceProvider.model,
+        healthy: providerState.healthy,
+        status: providerState.status,
+      });
+    }
     this.agent.workflowRuntimeState = this.workflowRuntimeState;
     this.evidence.record("workflow_runtime_probe", {
       agentId: this.agent.agentId,
@@ -793,7 +871,10 @@ class SwarmAgent {
   async sendHeartbeat({ awaitAck = false } = {}) {
     await this.refreshWorkflowRuntime();
     this.refreshServiceLifecycle();
-    const runner = workflowRunnerMetadata(this.agent, this.workflowRuntimeState);
+    const runner = constrainNodeAdvertisement(
+      this.agent,
+      workflowRunnerMetadata(this.agent, this.workflowRuntimeState),
+    );
     const lifecycle = serviceLifecycleAdvertisement(
       { ...this.agent, capabilities: runner.capabilities },
       this.serviceLifecycleState,
@@ -813,6 +894,7 @@ class SwarmAgent {
       serviceLifecycle: lifecycle.serviceLifecycle,
       executionAdapter: workflowRuntimeReady ? "workflow-runtime-http" : (this.agent.execution?.adapter ?? "receipt-only"),
       receiptOnly: !this.agent.execution && !workflowRuntimeReady,
+      ...this.workspaceAdvertisement(),
     }, { awaitAck });
     this.evidence.record("heartbeat_sent", { agentId: this.agent.agentId, machineId: this.machineId });
     void this.replayGrayMatterReceipts(false);
@@ -845,6 +927,13 @@ class SwarmAgent {
               event?.executionId ?? context?.executionId ?? "unknown"),
             eventId: Number(event?.id ?? 0),
             code: error?.code ?? "WORKFLOW_ENGINE_CALLBACK_FENCED",
+          }),
+        onLocalOnly: ({ event }) =>
+          this.evidence.record("workflow_engine_event_local_only", {
+            agentId: this.agent.agentId,
+            executionId: String(event?.executionId ?? "unknown"),
+            eventId: Number(event?.id ?? 0),
+            eventType: String(event?.eventType ?? "UNKNOWN").toUpperCase(),
           }),
         onEvent: async ({ event, context, terminal, checkpoint }) => {
           const eventType = String(event?.eventType ?? "UNKNOWN").toUpperCase();
@@ -1140,6 +1229,10 @@ class SwarmAgent {
             serviceHandle: resolved.handle,
             supervisor: resolved.supervisor,
             proof,
+            outcome: serviceRecoveryOutcome(wire, {
+              status: "SUCCEEDED",
+              summary: `Supervised ${resolved.handle} restart completed with fresh heartbeat proof`,
+            }),
           },
         };
         const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
@@ -1175,6 +1268,11 @@ class SwarmAgent {
             pendingRecovery: false,
             receiptOnly: false,
             serviceHandle: item.record.serviceHandle,
+            outcome: serviceRecoveryOutcome(wire, {
+              status: "FAILED",
+              summary: redactedError(error),
+              retryable: true,
+            }),
           },
         };
         const memoryReceipt = await this.persistTerminalReceipt(wire, failed);
@@ -1487,8 +1585,8 @@ class SwarmAgent {
         });
       };
     const execution = Promise.resolve()
-      .then(() => (serviceLifecycle
-        ? executeServiceLifecycleCommand({
+      .then(async () => {
+        if (serviceLifecycle) return executeServiceLifecycleCommand({
           agent: this.agent,
           machineId: this.machineId,
           onProgress,
@@ -1496,15 +1594,27 @@ class SwarmAgent {
           state: this.serviceLifecycleState,
           verifyRecovery: (binding) => this.verifyServiceRecovery(binding),
           wire,
-        })
-        : workflowRuntime ? executeWorkflowRuntimeCommand({
+        });
+        if (workflowRuntime) return executeWorkflowRuntimeCommand({
           agent: this.agent,
           wire,
           apiBase: this.apiBase,
           tokenProvider: this.tokenProvider,
           onProgress,
-        })
-        : this.runtimeExecutor({ agent: this.agent, wire, onProgress })))
+        });
+        const authorizedGrayMatterContext = await hydrateRuntimeGrayMatterContext({
+          apiBase: this.apiBase,
+          tokenProvider: this.tokenProvider,
+          wire,
+        });
+        return this.runtimeExecutor({
+          agent: this.agent,
+          wire: authorizedGrayMatterContext
+            ? { ...wire, authorizedGrayMatterContext }
+            : wire,
+          onProgress,
+        });
+      })
       .then(async (result) => {
         if (result?.pendingRecovery === true) {
           const pending = {
@@ -1794,6 +1904,13 @@ async function selfTest() {
   if (commandDisposition({ ...wire, commandId: "x".repeat(MAX_IDENTIFIER_LENGTH + 1) }, routingAgent).disposition !== "accept") {
     throw new Error("Command disposition must remain independent from command ID validation");
   }
+  const workspaceAgent = Object.create(SwarmAgent.prototype);
+  workspaceAgent.agent = { execution: { workingDirectory: "/workspace/chronicle" } };
+  const workspace = workspaceAgent.workspaceAdvertisement();
+  if (workspace.workspaceSummary.folderCount !== 1
+      || workspace.workspaceFolders[0] !== "/workspace/chronicle") {
+    throw new Error("SWARM workspace advertisement contract failed");
+  }
   for (const unsafeUrl of [
     "wss://operator:secret@api-0.valkyrlabs.com/swarm",
     "wss://api-0.valkyrlabs.com/swarm?token=secret",
@@ -1946,6 +2063,7 @@ export {
   readKeychainToken,
   redactedError,
   runtimeTerminalResponse,
+  serviceRecoveryOutcome,
   stompFrame,
   validateConfig,
   workflowEngineLifecycleResponse,

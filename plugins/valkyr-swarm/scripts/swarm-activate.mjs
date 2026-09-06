@@ -18,6 +18,10 @@ import {
   normalizeApiBase,
   persistAuthentication,
 } from "./swarm-auth.mjs";
+import {
+  providerDescriptor,
+  requireHealthyLocalInferenceProvider,
+} from "./swarm-local-inference-provider.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_SCRIPT = path.join(SCRIPT_DIR, "swarm-agent.mjs");
@@ -47,6 +51,7 @@ const DEFAULT_CAPABILITIES = {
     "social.draft", "outreach.draft", "support.research", "workspace.files.read",
   ],
   agent: ["task.write", "ticket.create", "workflow.debug", "workflow.remediate"],
+  "local-model": ["workflow.engine.execute-workflow"],
 };
 
 function usage(exitCode = 0) {
@@ -57,7 +62,7 @@ Authenticates, creates or updates a production tenant SWARM config, and starts i
 For unattended first use, set VALKYR_USERNAME and VALKYR_PASSWORD.
 
 Options:
-  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw
+  --runtime <name>            Auto-detected; codex, claude-code, openclaw, valoride, valklaw, local-model
   --agent-id <id>             Default <runtime>-<machine-id>
   --machine-id <id>           Default normalized hostname
   --capabilities <csv>        Runtime-safe defaults when omitted
@@ -70,6 +75,9 @@ Options:
   --workspace <path>          Runtime working directory
   --workflow-runtime          Install ValkyrAI's approved local Workflow runner
   --workflow-engine           Install the approved durable mini-ValkyrAI engine
+  --local-model-provider <p>  Model-only node provider: lm-studio or ollama
+  --local-model-id <id>       Exact locally loaded model identifier
+  --local-model-endpoint <u>  Optional loopback HTTP provider base URL
   --workflow-artifact-url <u> Optional approved-release override (with SHA-256)
   --workflow-artifact-sha256  SHA-256 paired with the artifact override
   --workflow-runtime-port <n> Loopback runtime port (default 8765)
@@ -100,6 +108,7 @@ function parseArgs(argv) {
     "--runtime-agent-id", "--runtime-executable", "--workspace",
     "--workflow-artifact-url", "--workflow-artifact-sha256", "--workflow-runtime-port",
     "--workflow-runtime-max-heap", "--workflow-credential-refs",
+    "--local-model-provider", "--local-model-id", "--local-model-endpoint",
     "--deployment-runner-endpoint", "--deployment-credential-ref",
   ]);
   for (let index = 0; index < argv.length; index += 1) {
@@ -217,7 +226,7 @@ function runtimeExecutable(runtime, override) {
 }
 
 function executionConfig(runtime, options, agentId, machineId) {
-  if (options.receiptOnly || runtime === "agent") return null;
+  if (options.receiptOnly || runtime === "agent" || runtime === "local-model") return null;
   const executable = runtimeExecutable(runtime, options.runtimeExecutable);
   if (!executable) {
     throw new Error(`No executable runtime found for ${runtime}; install its product CLI or use --receipt-only explicitly`);
@@ -273,6 +282,47 @@ function defaultReceiptLog(machineId) {
   return path.join(os.homedir(), ".local", "state", "valkyr-swarm", `${machineId}.jsonl`);
 }
 
+function configuredWorkflowRuntimePorts(configPath, excludeAgentId = "") {
+  if (!fs.existsSync(configPath)) return new Set();
+  let existing;
+  try {
+    existing = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (error) {
+    throw new Error(`Existing SWARM config is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const ports = new Set();
+  for (const configuredAgent of existing.agents ?? []) {
+    if (configuredAgent?.agentId === excludeAgentId) continue;
+    const endpoint = configuredAgent?.workflowRuntime?.endpoint;
+    if (!endpoint) continue;
+    try {
+      const port = Number(new URL(endpoint).port);
+      if (Number.isInteger(port)) ports.add(port);
+    } catch {
+      throw new Error(`Existing SWARM agent ${String(configuredAgent?.agentId ?? "unknown")} has an invalid Workflow runtime endpoint`);
+    }
+  }
+  return ports;
+}
+
+function selectWorkflowRuntimePort({ configPath, agentId, tier, requestedPort }) {
+  const usedPorts = configuredWorkflowRuntimePorts(configPath, agentId);
+  if (requestedPort != null && String(requestedPort).trim() !== "") {
+    const port = Number(requestedPort);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      throw new Error("workflow runtime port must be between 1024 and 65535");
+    }
+    if (usedPorts.has(port)) {
+      throw new Error(`workflow runtime port ${port} is already assigned to another SWARM agent`);
+    }
+    return port;
+  }
+  let port = tier === "engine" ? 8767 : 8765;
+  while (usedPorts.has(port) && port < 65535) port += 1;
+  if (port > 65535) throw new Error("No available Workflow runtime port remains");
+  return port;
+}
+
 function buildConfig(options) {
   const runtime = safeId(options.runtime ?? detectRuntime(), "runtime");
   const machineId = safeId(options.machineId ?? os.hostname(), "machineId");
@@ -292,6 +342,26 @@ function buildConfig(options) {
     capacity,
     capabilities: parseCapabilities(options.capabilities, runtime),
   };
+  const localModelRequested = runtime === "local-model" || options.localModelProvider;
+  if (localModelRequested) {
+    if (runtime !== "local-model") {
+      throw new Error("--local-model-provider requires --runtime local-model");
+    }
+    if (!options.workflowEngine) {
+      throw new Error("A model-only node requires --workflow-engine");
+    }
+    const provider = String(options.localModelProvider ?? "").trim();
+    if (!provider) throw new Error("A model-only node requires --local-model-provider");
+    agent.nodeContract = {
+      protocol: "valkyr-swarm-node/v1",
+      nodeClass: "model-only",
+      localInferenceProvider: providerDescriptor(
+        provider,
+        options.localModelId,
+        options.localModelEndpoint,
+      ),
+    };
+  }
   const deploymentRunnerEndpoint = parseDeploymentRunnerEndpoint(
     options.deploymentRunnerEndpoint ?? process.env.VALKYR_DEPLOYMENT_RUNNER_ENDPOINT,
   );
@@ -339,11 +409,12 @@ function buildConfig(options) {
     if (Boolean(artifactUrl) !== Boolean(sha256)) {
       throw new Error("Workflow runtime artifact URL and SHA-256 overrides must be supplied together");
     }
-    const port = Number(options.workflowRuntimePort ?? process.env.VALKYR_WORKFLOW_RUNTIME_PORT
-      ?? (tier === "engine" ? 8767 : 8765));
-    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-      throw new Error("workflow runtime port must be between 1024 and 65535");
-    }
+    const port = selectWorkflowRuntimePort({
+      configPath,
+      agentId,
+      tier,
+      requestedPort: options.workflowRuntimePort ?? process.env.VALKYR_WORKFLOW_RUNTIME_PORT,
+    });
     const heapOverride = options.workflowRuntimeMaxHeap
       ?? process.env.VALKYR_WORKFLOW_RUNTIME_MAX_HEAP;
     // Existing releases booted the full application and required this conservative fallback.
@@ -783,6 +854,8 @@ async function main() {
   }
   const token = await authenticate(target);
   await resolveWorkflowRuntimeRelease(target, token);
+  const localProvider = target.config.agents[0].nodeContract?.localInferenceProvider;
+  if (localProvider) await requireHealthyLocalInferenceProvider(localProvider);
   writeConfig(target);
   if (options.noService) {
     process.stdout.write(`${JSON.stringify({ ...summary, authenticated: true, started: false })}\n`);
@@ -816,9 +889,11 @@ export {
   parseWorkflowCredentialReferences,
   requireProductionApiBase,
   resolveWorkflowRuntimeRelease,
+  requireHealthyLocalInferenceProvider,
   runtimeExecutable,
   safeId,
   selectCapabilityPacksForAgent,
+  selectWorkflowRuntimePort,
   validateCapabilityPackReleases,
   validateWorkflowReleaseDescriptor,
   workflowReleaseDiscoveryTimeoutMs,

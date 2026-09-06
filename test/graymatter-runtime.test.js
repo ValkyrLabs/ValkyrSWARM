@@ -6,12 +6,87 @@ import test from "node:test";
 
 import {
   commandReceiptText,
+  hydrateRuntimeGrayMatterContext,
   persistCommandReceipt,
   persistWorkflowHandoff,
   queryMemory,
+  readGrayMatterObject,
+  readMemoryEntry,
   replayQueuedReceipts,
   writeMemory,
 } from "../scripts/swarm-graymatter.mjs";
+
+test("bridge reads and hydrates bounded GrayMatter context with its own token", async () => {
+  const memoryId = "05b5fe73-e216-4208-ab50-cc4213ad1963";
+  const requests = [];
+  const fetchImpl = async (url, options) => {
+    requests.push({ url, options });
+    return new Response(JSON.stringify({
+      id: memoryId,
+      type: "artifact",
+      sourceChannel: "codex:workspace:ChronicleAI",
+      tags: ["chronicleai", { name: "prd" }],
+      text: "ChronicleAI Product Requirements Document",
+      apiToken: "must-not-be-projected",
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  const entry = await readMemoryEntry({
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    token: "bridge-token",
+    id: memoryId,
+    fetchImpl,
+  });
+  assert.equal(requests[0].options.method, "GET");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer bridge-token");
+  assert.equal(new URL(requests[0].url).pathname, `/v1/MemoryEntry/${memoryId}`);
+  assert.equal(entry.type, "artifact");
+  assert.equal(entry.text, "ChronicleAI Product Requirements Document");
+  assert.match(entry.contentDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify(entry).includes("must-not-be-projected"), false);
+
+  const context = await hydrateRuntimeGrayMatterContext({
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "bridge-token",
+    wire: { command: { data: JSON.stringify({
+      grayMatterObjectRefs: [
+        { objectType: "ContentData", id: memoryId },
+        { objectType: "ContentData", id: memoryId },
+      ],
+    }) } },
+    fetchImpl,
+  });
+  assert.equal(context.access, "rbac-scoped-read-only");
+  assert.deepEqual(context.requestedRefs, [`ContentData:${memoryId}`]);
+  assert.equal(context.entries.length, 1);
+  assert.equal(context.entries[0].objectType, "ContentData");
+});
+
+test("typed ContentData hydration projects bounded PRD object-graph fields", async () => {
+  const id = "05b5fe73-e216-4208-ab50-cc4213ad1963";
+  const object = await readGrayMatterObject({
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    token: "bridge-token",
+    objectType: "ContentData",
+    id,
+    fetchImpl: async () => new Response(JSON.stringify({
+      id,
+      title: "PRD — Valkyr ChronicleAI",
+      subtitle: "Evidence-Backed Trust, Decisioning & Recovery Platform",
+      fileName: "ChronicleAI_PRD.md",
+      contentType: "markdown",
+      status: "editing",
+      version: 2,
+      contentData: "# PRD — Valkyr ChronicleAI",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }),
+  });
+  assert.equal(object.objectType, "ContentData");
+  assert.equal(object.title, "PRD — Valkyr ChronicleAI");
+  assert.equal(object.type, "markdown");
+  assert.equal(object.version, 2);
+  assert.equal(object.text, "# PRD — Valkyr ChronicleAI");
+  assert.match(object.contentDigest, /^sha256:[0-9a-f]{64}$/);
+});
 
 test("runtime persists a bounded tenant-derived GrayMatter terminal receipt", async () => {
   let captured;

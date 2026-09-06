@@ -28,6 +28,7 @@ for (const relative of [
   "scripts/swarm-doctor.mjs",
   "scripts/swarm-graymatter.mjs",
   "scripts/swarm-login.mjs",
+  "scripts/swarm-local-inference-provider.mjs",
   "scripts/swarm-openclaw-bootstrap.mjs",
   "scripts/swarm-service.mjs",
   "scripts/swarm-service-lifecycle.mjs",

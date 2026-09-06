@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valkyrlabs.com/contracts/runtime/valkyr-swarm-node.v1.schema.json",
+  "title": "Valkyr SWARM node contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "nodeClass"],
+  "properties": {
+    "protocol": { "const": "valkyr-swarm-node/v1" },
+    "nodeClass": { "enum": ["agentic-runtime", "model-only"] },
+    "localInferenceProvider": {
+      "$ref": "./valkyr-local-inference-provider.v1.schema.json"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "nodeClass": { "const": "model-only" } } },
+      "then": { "required": ["localInferenceProvider"] },
+      "else": { "not": { "required": ["localInferenceProvider"] } }
+    }
+  ]
+}

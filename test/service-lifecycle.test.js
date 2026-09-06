@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { commandDisposition } from "../scripts/swarm-agent.mjs";
+import {
+  commandDisposition,
+  runtimeTerminalResponse,
+  serviceRecoveryOutcome,
+} from "../scripts/swarm-agent.mjs";
 import { commandReceiptText } from "../scripts/swarm-graymatter.mjs";
 import {
   SERVICE_RESTART_ACTION,
@@ -262,6 +266,35 @@ test("shared bridge restart checkpoints durable recovery before invoking launchd
   assert.match(pending[0].record.approvalRef, /^gm_approval_[0-9a-f]{64}$/);
   assert.equal(calls.some(({ args }) => args[0] === "kickstart"), true);
   fx.cleanup();
+});
+
+test("service recovery emits a bound terminal outcome accepted by runtime validation", () => {
+  const restartWire = wire(SERVICE_RESTART_ACTION, "codex");
+  const outcome = serviceRecoveryOutcome(restartWire, {
+    status: "SUCCEEDED",
+    summary: "Supervised codex restart completed with fresh heartbeat proof",
+  });
+  const terminal = runtimeTerminalResponse({
+    adapter: "native-service-lifecycle",
+    executed: true,
+    proof: { healthy: true, heartbeatFresh: true },
+    outcome,
+  }, restartWire);
+
+  assert.equal(terminal.type, "ACK");
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.result.outcome.status, "SUCCEEDED");
+  assert.deepEqual(
+    terminal.result.outcome.evidenceRefs,
+    ["swarm-service-recovery:command-1"],
+  );
+  assert.equal(terminal.result.outcome.source, "runtime-envelope");
+  assert.equal(terminal.result.outcome.confidence, "EXPLICIT");
+  assert.deepEqual(terminal.result.outcome.metadata, {
+    proofSource: "native-service-lifecycle",
+    proofConfidence: "VERIFIED",
+  });
+  assert.equal(terminal.result.outcome.approvalRef, restartWire.command.approvalRef);
 });
 
 test("failed shared bridge restart removes its pending recovery checkpoint", async () => {

@@ -8,6 +8,7 @@ import process from "node:process";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { workflowRuntimeConfig } from "./swarm-workflow-runtime.mjs";
+import { workflowGrantTrustPath } from "./swarm-workflow-trust.mjs";
 
 const LABEL_PREFIX = "com.valkyrlabs.workflow-runtime";
 const WORKFLOW_RUNNER_MAIN = "com.valkyrlabs.workflow.runner.WorkflowRunnerApplication";
@@ -55,6 +56,9 @@ function safeRuntimeArgument(value) {
   const text = safeArgument(value, "runtime argument");
   if (/(password|passwd|secret|token|credential|authorization|api[-_.]?key|bearer)/i.test(text)) {
     throw new Error("workflowRuntime.install.arguments must not contain credential material");
+  }
+  if (/grant-(trust-file|trusted-issuers-json|tenant-id|swarm-instance-id)/i.test(text)) {
+    throw new Error("Workflow public trust is owned by authenticated bootstrap");
   }
   return text;
 }
@@ -287,6 +291,7 @@ function loadSpec(configPath, agentId, platform = process.platform) {
     configPath: resolvedConfig,
     endpoint,
     engineKeyPath,
+    grantTrustPath: tier === "engine" ? workflowGrantTrustPath(agent) : null,
     javaExecutable: safeArgument(install.javaExecutable ?? "java", "javaExecutable"),
     jvmArgs: Array.isArray(install.jvmArgs) ? install.jvmArgs.map((v) => safeArgument(v, "JVM argument")) : [],
     label,
@@ -332,6 +337,7 @@ function runtimeArguments(spec) {
     ...(engine ? [
       `--valkyrai.workflow.engine.database-path=${spec.runtimeDataPath}`,
       `--valkyrai.workflow.engine.key-file=${spec.engineKeyPath}`,
+      `--valkyrai.workflow.engine.grant-trust-file=${spec.grantTrustPath}`,
       `--valkyrai.workflow.engine.enabled-packs=${["core-transforms", ...packs.map((pack) => pack.id)].join(",")}`,
       `--valkyrai.workflow.engine.node-capabilities=${(spec.nodeCapabilities ?? []).join(",")}`,
       `--valkyrai.workflow.engine.workspace-roots=${(spec.workspaceRoots ?? []).join(",")}`,
@@ -547,6 +553,7 @@ function uninstall(spec) {
   fs.rmSync(spec.artifactPath, { force: true });
   fs.rmSync(spec.runtimePropertiesPath, { force: true });
   fs.rmSync(spec.engineKeyPath, { force: true });
+  if (spec.grantTrustPath) fs.rmSync(spec.grantTrustPath, { force: true });
   fs.rmSync(spec.capabilityPackRoot, { recursive: true, force: true });
   for (const suffix of [".mv.db", ".trace.db", ".lock.db"]) {
     fs.rmSync(`${spec.runtimeDataPath}${suffix}`, { force: true });
@@ -570,6 +577,7 @@ function selfTest() {
     configPath: "/tmp/swarm.json",
     endpoint: new URL("http://127.0.0.1:8765/v1/swarm/workflow-runs/execute"),
     engineKeyPath: "/tmp/workflow-test.engine-key",
+    grantTrustPath: "/tmp/workflow-test.grant-trust.json",
     javaExecutable: "/usr/bin/java",
     jvmArgs: ["-Xmx512m"],
     label: "com.valkyrlabs.workflow-runtime.workflow-test",

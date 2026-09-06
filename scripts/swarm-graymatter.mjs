@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -16,6 +17,10 @@ const PROTECTED_ACTIONS = new Set([
   "service.lifecycle.restart",
 ]);
 const CANONICAL_APPROVAL_REF = /^gm_approval_[0-9a-f]{64}$/;
+const MEMORY_ENTRY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_CONTEXT_MEMORY_REFS = 8;
+const MAX_CONTEXT_MEMORY_TEXT_CHARS = 6_000;
+const CONTEXT_OBJECT_TYPES = new Set(["ContentData", "MemoryEntry"]);
 
 function boundedText(value, max = MAX_MEMORY_TEXT_CHARS) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? {});
@@ -91,6 +96,109 @@ async function requestGrayMatter({ apiBase, token, pathname, body, fetchImpl = f
   }
   if (!response.ok) throw new Error(`GrayMatter ${pathname} returned HTTP ${response.status}`);
   return parsed;
+}
+
+async function readGrayMatterObject({ apiBase, token, objectType, id, fetchImpl = fetch }) {
+  const memoryId = String(id ?? "").trim();
+  const type = String(objectType ?? "").trim();
+  if (!CONTEXT_OBJECT_TYPES.has(type)) throw new Error("Unsupported GrayMatter context object type");
+  if (!MEMORY_ENTRY_ID.test(memoryId)) throw new Error("Invalid GrayMatter MemoryEntry ID");
+  const response = await fetchImpl(
+    `${normalizeApiBase(apiBase)}/${type}/${encodeURIComponent(memoryId)}`,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(GRAYMATTER_REQUEST_TIMEOUT_MS),
+    },
+  );
+  if (!response.ok) throw new Error(`GrayMatter ${type} read returned HTTP ${response.status}`);
+  const value = await response.json();
+  const entry = {
+    id: memoryId,
+    objectType: type,
+    type: boundedText(value?.type ?? value?.contentType ?? "unknown", 80),
+    title: boundedText(value?.title ?? value?.name ?? "", 500),
+    subtitle: boundedText(value?.subtitle ?? "", 500),
+    fileName: boundedText(value?.fileName ?? "", 240),
+    status: boundedText(value?.status ?? "", 80),
+    version: value?.version ?? null,
+    slug: boundedText(value?.slug ?? "", 240),
+    sourceChannel: boundedText(value?.sourceChannel ?? value?.source ?? "", 200),
+    tags: Array.isArray(value?.tags)
+      ? value.tags.slice(0, 25).map((tag) => safeTag(tag?.name ?? tag)).filter(Boolean)
+      : [],
+    text: redactText(value?.text ?? value?.contentData ?? value?.content ?? "", MAX_CONTEXT_MEMORY_TEXT_CHARS),
+  };
+  entry.contentDigest = `sha256:${createHash("sha256").update(JSON.stringify(entry)).digest("hex")}`;
+  return entry;
+}
+
+async function readMemoryEntry(options) {
+  return readGrayMatterObject({ ...options, objectType: "MemoryEntry" });
+}
+
+function structuredCommandData(wire) {
+  const command = wire?.command ?? {};
+  const raw = command?.payload?.data ?? command?.data ?? command?.payload ?? {};
+  if (typeof raw !== "string") return raw && typeof raw === "object" ? raw : {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function requestedGrayMatterObjects(wire) {
+  const data = structuredCommandData(wire);
+  const objectRefs = data?.grayMatterObjectRefs;
+  if (objectRefs !== undefined) {
+    if (!Array.isArray(objectRefs) || objectRefs.length > MAX_CONTEXT_MEMORY_REFS) {
+      throw new Error(`grayMatterObjectRefs must contain at most ${MAX_CONTEXT_MEMORY_REFS} refs`);
+    }
+    const unique = new Map();
+    for (const ref of objectRefs) {
+      const objectType = String(ref?.objectType ?? ref?.type ?? "").trim();
+      const id = String(ref?.id ?? "").trim();
+      if (!CONTEXT_OBJECT_TYPES.has(objectType)) {
+        throw new Error("Unsupported GrayMatter context object type");
+      }
+      if (!MEMORY_ENTRY_ID.test(id)) throw new Error("Invalid GrayMatter object ID");
+      unique.set(`${objectType}:${id}`, { objectType, id });
+    }
+    return [...unique.values()];
+  }
+  const raw = data?.grayMatterMemoryRefs;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > MAX_CONTEXT_MEMORY_REFS) {
+    throw new Error(`grayMatterMemoryRefs must contain at most ${MAX_CONTEXT_MEMORY_REFS} IDs`);
+  }
+  return [...new Set(raw.map((id) => String(id ?? "").trim()))].map((id) => {
+    if (!MEMORY_ENTRY_ID.test(id)) throw new Error("Invalid GrayMatter MemoryEntry ID");
+    return { objectType: "MemoryEntry", id };
+  });
+}
+
+async function hydrateRuntimeGrayMatterContext({
+  apiBase,
+  tokenProvider,
+  wire,
+  fetchImpl = fetch,
+}) {
+  const refs = requestedGrayMatterObjects(wire);
+  if (refs.length === 0) return null;
+  const token = await tokenProvider();
+  if (!token) throw new Error("GrayMatter context hydration requires authenticated SWARM access");
+  const entries = [];
+  for (const ref of refs) {
+    entries.push(await readGrayMatterObject({ apiBase, token, ...ref, fetchImpl }));
+  }
+  return {
+    schemaVersion: "valkyr-swarm-graymatter-context/v1",
+    access: "rbac-scoped-read-only",
+    requestedRefs: refs.map(({ objectType, id }) => `${objectType}:${id}`),
+    entries,
+  };
 }
 
 async function writeMemory({
@@ -467,8 +575,11 @@ export {
   commandReceiptText,
   persistCommandReceipt,
   persistWorkflowHandoff,
+  hydrateRuntimeGrayMatterContext,
   queryMemory,
   queueReceiptReplay,
+  readGrayMatterObject,
+  readMemoryEntry,
   replayQueuedReceipts,
   redactStructured,
   requestGrayMatter,

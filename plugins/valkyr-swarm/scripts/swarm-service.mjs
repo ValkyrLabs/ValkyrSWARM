@@ -16,6 +16,8 @@ const SERVICE_RUNTIME_FILES = Object.freeze([
   "swarm-auth.mjs",
   "swarm-command-journal.mjs",
   "swarm-graymatter.mjs",
+  "swarm-local-inference-provider.mjs",
+  "swarm-node-contract.mjs",
   "swarm-runtime-adapters.mjs",
   "swarm-service-lifecycle.mjs",
   "swarm-workflow-runtime.mjs",

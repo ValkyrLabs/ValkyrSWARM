@@ -130,6 +130,12 @@ function buildRuntimePrompt(wire, agent) {
     "",
     "Task payload:",
     boundedText(commandData, MAX_PROMPT_CHARS),
+    wire?.authorizedGrayMatterContext
+      ? "Authorized GrayMatter context hydrated by the SWARM bridge (RBAC-scoped, read-only):"
+      : null,
+    wire?.authorizedGrayMatterContext
+      ? boundedText(wire.authorizedGrayMatterContext, 10_000)
+      : null,
   ].filter(Boolean).join("\n");
 }
 

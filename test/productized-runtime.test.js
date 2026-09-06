@@ -11,6 +11,7 @@ import {
   requireProductionApiBase,
   resolveWorkflowRuntimeRelease,
   selectCapabilityPacksForAgent,
+  selectWorkflowRuntimePort,
   validateWorkflowReleaseDescriptor,
   workflowReleaseDiscoveryTimeoutMs,
   workflowRuntimeForegroundArguments,
@@ -136,6 +137,44 @@ test("activation merges multiple product nodes into one supervised machine confi
     "codex-cli",
     "valoride-cli",
   ]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("Workflow runtime ports are unique across agents in a merged machine config", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-ports-"));
+  const config = path.join(root, "agent.json");
+  const receipt = path.join(root, "receipt.jsonl");
+  const first = buildConfig({
+    runtime: "codex",
+    machineId: "shared-host",
+    runtimeExecutable: "/bin/echo",
+    workflowEngine: true,
+    workflowArtifactUrl: "https://downloads.example.test/engine.jar",
+    workflowArtifactSha256: "a".repeat(64),
+    config,
+    receiptLog: receipt,
+  });
+  writeConfig(first);
+  const second = buildConfig({
+    runtime: "local-model",
+    agentId: "lm-studio-gemma4-shared-host",
+    machineId: "shared-host",
+    workflowEngine: true,
+    workflowArtifactUrl: "https://downloads.example.test/engine.jar",
+    workflowArtifactSha256: "b".repeat(64),
+    localModelProvider: "lm-studio",
+    localModelId: "google/gemma-4-e4b",
+    config,
+    receiptLog: receipt,
+  });
+  assert.equal(first.config.agents[0].workflowRuntime.endpoint.includes(":8767/"), true);
+  assert.equal(second.config.agents[0].workflowRuntime.endpoint.includes(":8768/"), true);
+  assert.throws(() => selectWorkflowRuntimePort({
+    configPath: config,
+    agentId: "another-agent",
+    tier: "engine",
+    requestedPort: 8767,
+  }), /already assigned/);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -574,6 +613,43 @@ test("runtime prompt keeps bounded commands from expanding into unrelated work",
   assert.match(prompt, /Obey only the bounded Task payload/);
   assert.match(prompt, /Do not expand a direct or read-only task/);
   assert.match(prompt, /Use GrayMatter for durable shared context/);
+});
+
+test("runtime prompt includes bridge-hydrated GrayMatter context without changing command binding", () => {
+  const wire = {
+    action: "code.execute",
+    commandId: "cmd-graymatter-context",
+    targetInstanceId: "valoride-builder",
+    command: {
+      data: {
+        objective: "Verify the ChronicleAI PRD",
+        grayMatterMemoryRefs: ["05b5fe73-e216-4208-ab50-cc4213ad1963"],
+      },
+      scope: { applicationId: "chronicle-app" },
+    },
+  };
+  const before = commandBinding(wire);
+  const hydrated = {
+    ...wire,
+    authorizedGrayMatterContext: {
+      schemaVersion: "valkyr-swarm-graymatter-context/v1",
+      access: "rbac-scoped-read-only",
+      requestedRefs: ["MemoryEntry:05b5fe73-e216-4208-ab50-cc4213ad1963"],
+      entries: [{
+        id: "05b5fe73-e216-4208-ab50-cc4213ad1963",
+        type: "artifact",
+        sourceChannel: "codex:workspace:ChronicleAI",
+        text: "ChronicleAI Product Requirements Document",
+      }],
+    },
+  };
+  const prompt = buildRuntimePrompt(hydrated, { runtime: "valoride", agentId: "valoride-builder" });
+  const after = commandBinding(hydrated);
+  assert.equal(after.actionDigest, before.actionDigest);
+  assert.equal(after.scopeDigest, before.scopeDigest);
+  assert.match(prompt, /Authorized GrayMatter context hydrated by the SWARM bridge/);
+  assert.match(prompt, /ChronicleAI Product Requirements Document/);
+  assert.match(prompt, /RBAC-scoped, read-only/);
 });
 
 test("OpenClaw and ValorIDE adapters execute and stream terminal progress", async () => {

@@ -113,6 +113,7 @@ test("workflow engine service loads and enables only its installed capability pa
     configPath: "/private/agent.json",
     endpoint: new URL("http://127.0.0.1:8767/v1/swarm/workflow-engine/execute"),
     engineKeyPath: "/private/engine.key",
+    grantTrustPath: "/private/engine.grant-trust.json",
     jvmArgs: [],
     nodeCapabilities: ["market.research", "workflow.engine.execute-workflow"],
     runtimeDataPath: "/private/engine-data",
@@ -124,6 +125,7 @@ test("workflow engine service loads and enables only its installed capability pa
   assert.equal(args.includes("--valkyrai.workflow.engine.node-capabilities=market.research,workflow.engine.execute-workflow"), true);
   assert.equal(args.includes("--valkyrai.workflow.engine.workspace-roots=/private/project"), true);
   assert.equal(args.includes("--valkyrai.workflow.engine.process-home=/private/engine-work"), true);
+  assert.equal(args.includes("--valkyrai.workflow.engine.grant-trust-file=/private/engine.grant-trust.json"), true);
   assert.equal(args.includes("--valkyrai.workflow.engine.allowed-credential-references=keychain:OPENCLAW_API:default"), true);
   assert.equal(args.some((arg) => /password|secret|authorization|bearer/i.test(arg)), false);
 });

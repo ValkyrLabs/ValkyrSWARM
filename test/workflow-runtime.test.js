@@ -430,6 +430,89 @@ test("durable engine acknowledges only explicitly non-retryable fenced journal e
   assert.deepEqual(JSON.parse(acknowledgement.options.body), { through: 1 });
 });
 
+test("durable engine advances local-only proof events without emitting mothership callbacks", async () => {
+  const engineAgent = {
+    ...agent,
+    workflowRuntime: {
+      ...agent.workflowRuntime,
+      tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health",
+    },
+  };
+  const calls = [];
+  const localOnly = [];
+  const replayed = [];
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    calls.push({ url: value, options });
+    if (value.endsWith("/events/ack")) {
+      return new Response(JSON.stringify({
+        acknowledged: JSON.parse(options.body).through,
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (value.includes("127.0.0.1:8767/v1/swarm/workflow-engine/events")) {
+      return new Response(JSON.stringify({
+        acknowledged: 0,
+        events: [
+          {
+            id: 10,
+            executionId: "local-proof-execution",
+            eventType: "TASK_STARTED",
+            workflowRunnerId: "local-proof-runner",
+            workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            definitionSnapshotHash: "d".repeat(64),
+            leaseFence: 1,
+            callbacks: {
+              swarmCommandId: "local-proof:local-proof-execution",
+              swarmTraceId: "local-proof-trace",
+            },
+            payload: { taskId: "local-proof-task" },
+          },
+          {
+            id: 11,
+            executionId: "local-proof-execution",
+            eventType: "CHECKPOINT",
+            workflowRunnerId: "local-proof-runner",
+            workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            definitionSnapshotHash: "d".repeat(64),
+            leaseFence: 1,
+            callbacks: {
+              swarmCommandId: "local-proof:local-proof-execution",
+              swarmTraceId: "local-proof-trace",
+            },
+            payload: { state: "WAITING_APPROVAL" },
+          },
+        ],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`Local-only proof unexpectedly contacted ${value}`);
+  };
+
+  const replay = await forwardWorkflowEngineEventsOnce({
+    agent: engineAgent,
+    apiBase: "https://api-0.valkyrlabs.com/v1",
+    tokenProvider: async () => "session-token",
+    fetchImpl,
+    onLocalOnly: async (event) => localOnly.push(event),
+    onEvent: async (event) => replayed.push(event),
+  });
+
+  assert.equal(replay.next, 11);
+  assert.equal(replay.activeExecutions.size, 0);
+  assert.equal(localOnly.length, 2);
+  assert.equal(replayed.length, 0);
+  assert.equal(calls.filter((call) => call.url.includes("api-0.valkyrlabs.com")).length, 0);
+  const acknowledgement = calls.find((call) => call.url.endsWith("/events/ack"));
+  assert.deepEqual(JSON.parse(acknowledgement.options.body), { through: 11 });
+});
+
 test("durable engine never acknowledges ordinary authorization failures", async () => {
   const engineAgent = {
     ...agent,
@@ -732,6 +815,7 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
           terminalState: "WAITING_UNTIL",
           finalState: { running: true, cycle: 1 },
           checkpointRef: "checkpoint:1",
+          waitingUntil: "2026-09-06T17:30:00Z",
         }),
       ].join("\n"), { status: 200, headers: { "content-type": "application/x-ndjson" } });
     }
@@ -771,6 +855,7 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
   assert.equal(body.workflowVersionId, "version-1");
   assert.equal(body.definitionSnapshotHash, "c".repeat(64));
   assert.equal(body.checkpointRef, "checkpoint:1");
+  assert.equal(body.waitingUntil, "2026-09-06T17:30:00Z");
   assert.deepEqual(body.finalState, { running: true, cycle: 1 });
   const local = calls.find((call) => call.url.includes("127.0.0.1:8765"));
   assert.equal(JSON.parse(local.options.body).protocol, "valkyr-workflow-engine/v1");

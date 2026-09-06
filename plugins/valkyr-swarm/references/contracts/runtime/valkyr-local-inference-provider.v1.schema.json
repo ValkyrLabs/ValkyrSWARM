@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valkyrlabs.com/contracts/runtime/valkyr-local-inference-provider.v1.schema.json",
+  "title": "Valkyr local inference provider descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "kind", "endpoint", "model", "operations"],
+  "properties": {
+    "protocol": { "const": "valkyr-local-inference-provider/v1" },
+    "kind": { "enum": ["lm-studio", "ollama"] },
+    "endpoint": {
+      "type": "string",
+      "pattern": "^http://(?:127\\.0\\.0\\.1|localhost|\\[::1\\])(?::[0-9]{1,5})?(?:/[^?#]*)?$"
+    },
+    "model": { "type": "string", "minLength": 1, "maxLength": 240 },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "models.list",
+          "inference.chat",
+          "inference.stream",
+          "inference.cancel",
+          "inference.structured-output"
+        ]
+      }
+    }
+  }
+}

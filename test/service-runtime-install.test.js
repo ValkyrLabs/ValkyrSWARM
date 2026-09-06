@@ -41,6 +41,8 @@ test("native service definitions use a private content-addressed runtime outside
 });
 
 test("service runtime staging copies the exact dependency closure and fails closed on tampering", () => {
+  assert.equal(SERVICE_RUNTIME_FILES.includes("swarm-node-contract.mjs"), true);
+  assert.equal(SERVICE_RUNTIME_FILES.includes("swarm-local-inference-provider.mjs"), true);
   const temporaryRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "valkyr-swarm-service-runtime-"),
   );

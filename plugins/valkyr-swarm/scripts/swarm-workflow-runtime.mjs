@@ -1,3 +1,5 @@
+import { bootstrapWorkflowGrantTrust } from "./swarm-workflow-trust.mjs";
+
 const WORKFLOW_RUNNER_ACTION = "workflow.runner.execute-module";
 const WORKFLOW_ENGINE_ACTION = "workflow.engine.execute-workflow";
 const WORKFLOW_ENGINE_KILL_ACTION = "workflow.engine.kill-execution";
@@ -207,6 +209,7 @@ async function forwardWorkflowEngineEventsOnce({
   onProgress,
   onEvent,
   onDiscarded,
+  onLocalOnly,
 }) {
   const config = workflowRuntimeConfig(agent);
   if (!config || config.tier !== "engine" || !config.eventsEndpoint) {
@@ -245,6 +248,26 @@ async function forwardWorkflowEngineEventsOnce({
     };
     const terminal = ["SUCCESS", "FAILED", "CANCELLED"].includes(eventType);
     const checkpoint = eventType === "CHECKPOINT";
+    // Correlation identifiers are metadata, not callback transports. Local
+    // sandbox/proof executions legitimately retain a command id so duplicate
+    // materialization can be detected, but they must never escape the host
+    // unless the mothership supplied at least one fenced callback path.
+    const localOnly = [
+      callbacks.heartbeat,
+      callbacks.materialize,
+      callbacks.progress,
+      callbacks.complete,
+    ].every((value) => typeof value !== "string" || value.trim() === "");
+    if (localOnly) {
+      active.delete(executionId);
+      next = eventId;
+      await onLocalOnly?.({ event, context, terminal, checkpoint });
+      onProgress?.({
+        stream: "workflow",
+        text: `Advanced local-only Workflow engine event ${eventType} (${eventId})`,
+      });
+      continue;
+    }
     try {
       if (terminal || checkpoint) {
         const completeUrl = callbackUrl(apiBase, callbacks.complete);
@@ -492,6 +515,7 @@ async function authorizedJson(url, body, tokenProvider, fetchImpl) {
     if (!token) throw new Error("Remote workflow callback requires an authenticated SWARM session");
     return fetchImpl(url, {
       method: "POST",
+      redirect: "error",
       signal: AbortSignal.timeout(30_000),
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json" },
       body: encodedBody,
@@ -677,6 +701,9 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     throw new Error("Remote workflow materialization does not match the fenced command");
   }
   onProgress?.({ stream: "workflow", text: "Immutable workflow materialization authorized" });
+  if (engineExecution && materialization.materializationProof) {
+    await bootstrapWorkflowGrantTrust({ agent, apiBase, runnerId: payload.workflowRunnerId, tokenProvider, fetchImpl });
+  }
   let heartbeatActive = false;
   const heartbeatTimer = setInterval(() => {
     if (heartbeatActive) return;
@@ -738,6 +765,7 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     completion.finalState = success ? (result?.finalState ?? result?.outputs ?? result?.result ?? {}) : {};
     completion.checkpointRef = result?.checkpointRef ?? null;
     completion.approvalRef = result?.approvalRef ?? null;
+    completion.waitingUntil = result?.waitingUntil ?? null;
     completion.terminalState = String(result?.terminalState ?? (success ? "SUCCESS" : "FAILED"));
   }
   const completedRun = await authorizedJson(completionUrl, completion, tokenProvider, fetchImpl);
