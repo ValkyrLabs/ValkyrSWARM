@@ -6,6 +6,13 @@
 - Agent configuration contains stable machine/runtime identifiers and private credential-file references, never caller-supplied tenant identity.
 - Every command targets one exact registered instance and one advertised capability or supported tool.
 
+## Shared secure-session recovery
+
+- Each reconnect rereads the canonical secure session. On forced refresh, a peer may reuse a different session from the deterministic Keychain account or configured private token file before requiring reusable credentials. An unchanged rejected session never counts as recovery.
+- The comparison belongs to the failing socket. A healthy peer reading the new shared session must not prevent another peer from recovering. Rejected tokens remain private in-process state and never enter evidence, configuration or command receipts.
+- Concurrent credential refreshes share one login and persistence operation; a failed login permits a later retry. Events from replaced sockets cannot invalidate their replacements or schedule recovery for them.
+- Source or package validation does not establish installed health. Governed activation must still prove the exact registered agent, fresh server heartbeat, advertised capabilities and terminal receipt.
+
 ## Governed native service lifecycle
 
 - `service.lifecycle.status` is bounded, read-only inspection. `service.lifecycle.restart` is protected and requires the mothership-injected content-bound `gm_approval_...` reference for the exact target agent, expected machine, and semantic service handle.

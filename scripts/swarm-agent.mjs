@@ -154,21 +154,38 @@ function createTokenProvider(
   } = {},
 ) {
   let initialToken = configuredToken;
-  return async ({ forceRefresh = false } = {}) => {
+  let refreshInFlight = null;
+  return async ({ forceRefresh = false, rejectedToken } = {}) => {
     if (!forceRefresh) {
       if (initialToken) return initialToken;
       const storedToken = keychainReader(keychainService) ?? fileReader(tokenFile);
       if (storedToken) return storedToken;
+    } else if (typeof rejectedToken === "string" && rejectedToken) {
+      // Another authorized client may already have replaced the secure session.
+      // Compare against this socket's rejected token, never a healthy peer's last read.
+      const storedToken = keychainReader(keychainService) ?? fileReader(tokenFile);
+      if (storedToken && storedToken !== rejectedToken) {
+        initialToken = null;
+        return storedToken;
+      }
     }
+    if (refreshInFlight) return refreshInFlight;
     const credentials = credentialReader({ keychainService, credentialFile });
     if (!credentials?.username || !credentials?.password) {
       if (forceRefresh) throw new Error("Authentication expired and no reusable username/password is available");
       return null;
     }
-    const token = await login({ ...credentials, apiBase });
-    persist({ token, ...credentials, keychainService, tokenFile, credentialFile });
-    initialToken = null;
-    return token;
+    refreshInFlight = (async () => {
+      const token = await login({ ...credentials, apiBase });
+      persist({ token, ...credentials, keychainService, tokenFile, credentialFile });
+      initialToken = null;
+      return token;
+    })();
+    try {
+      return await refreshInFlight;
+    } finally {
+      refreshInFlight = null;
+    }
   };
 }
 
@@ -574,6 +591,8 @@ class EvidenceLog {
 }
 
 class SwarmAgent {
+  #connectionToken = null;
+
   constructor({
     agent,
     apiBase,
@@ -630,7 +649,11 @@ class SwarmAgent {
     if (this.stopped) return;
     let token;
     try {
-      token = await this.tokenProvider({ forceRefresh: this.forceAuthRefresh });
+      token = await this.tokenProvider({
+        forceRefresh: this.forceAuthRefresh,
+        ...(this.forceAuthRefresh && this.#connectionToken
+          ? { rejectedToken: this.#connectionToken } : {}),
+      });
       this.forceAuthRefresh = false;
     } catch (error) {
       this.evidence.record("auth_unavailable", {
@@ -649,8 +672,10 @@ class SwarmAgent {
       return;
     }
     const websocket = new WebSocket(this.url, ["v12.stomp"]);
+    this.#connectionToken = token;
     this.websocket = websocket;
     websocket.addEventListener("open", () => {
+      if (this.websocket !== websocket || this.stopped) return;
       websocket.send(stompFrame("CONNECT", {
         "accept-version": "1.2",
         host: new URL(this.url).host,
@@ -661,13 +686,17 @@ class SwarmAgent {
         "heart-beat": "10000,10000",
       }));
     });
-    websocket.addEventListener("message", (event) => this.onData(event.data));
+    websocket.addEventListener("message", (event) => {
+      if (this.websocket === websocket && !this.stopped) this.onData(event.data);
+    });
     websocket.addEventListener("error", () => {
-      if (!this.stopped) {
+      if (this.websocket === websocket && !this.stopped) {
         this.evidence.record("socket_error", { agentId: this.agent.agentId });
       }
     });
-    websocket.addEventListener("close", (event) => this.onClose(event));
+    websocket.addEventListener("close", (event) => {
+      if (this.websocket === websocket) this.onClose(event);
+    });
   }
 
   onData(raw) {

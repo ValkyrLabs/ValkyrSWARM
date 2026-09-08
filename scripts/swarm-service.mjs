@@ -21,6 +21,7 @@ const SERVICE_RUNTIME_FILES = Object.freeze([
   "swarm-runtime-adapters.mjs",
   "swarm-service-lifecycle.mjs",
   "swarm-workflow-runtime.mjs",
+  "swarm-workflow-trust.mjs",
 ]);
 
 function usage(exitCode = 0) {
