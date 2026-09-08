@@ -215,13 +215,17 @@ function probeServiceBinding(bindingValue, {
   }
   const result = runSupervisor(binding, "status", spawnImpl, uid);
   const stdout = String(result.stdout ?? "");
-  const running = binding.supervisor === "launchd"
-    ? result.status === 0
-    : result.status === 0 && /ActiveState=active(?:\r?\n|$)/.test(stdout);
   const pidMatch = binding.supervisor === "launchd"
-    ? /\bpid\s*=\s*(\d+)/.exec(stdout)
-    : /\bMainPID=(\d+)/.exec(stdout);
-  const pid = pidMatch && Number(pidMatch[1]) > 0 ? Number(pidMatch[1]) : null;
+    ? /^\s*pid\s*=\s*(\d+)\s*$/m.exec(stdout)
+    : /^MainPID=(\d+)\r?$/m.exec(stdout);
+  const parsedPid = pidMatch ? Number(pidMatch[1]) : null;
+  const pid = Number.isSafeInteger(parsedPid) && parsedPid > 0 ? parsedPid : null;
+  // A successful lookup proves a loaded job, not a live supervised process.
+  const running = result.status === 0 && pid !== null && (
+    binding.supervisor === "launchd"
+      ? /^\s*state\s*=\s*running\s*$/m.test(stdout)
+      : /^ActiveState=active\r?$/m.test(stdout) && /^SubState=running\r?$/m.test(stdout)
+  );
   return {
     handle: binding.handle,
     installed: true,
