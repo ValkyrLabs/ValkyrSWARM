@@ -26,7 +26,7 @@ const SERVICE_RUNTIME_FILES = Object.freeze([
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: node scripts/swarm-service.mjs <command> --config <json> [options]\n\nInstalls and operates a launchd or systemd-user service for one SWARM host.\n\nCommands:\n  install          Install and start the service\n  uninstall        Stop and remove the service\n  start            Start the installed service\n  stop             Stop the service\n  restart          Restart the service\n  status           Print service state\n  print-service    Print the native service definition\n  print-plist      Alias for macOS compatibility\n  print-unit       Alias for Linux compatibility\n  self-test        Validate service safety offline\n\nOptions:\n  --config <path>              Machine SWARM configuration\n  --url <url>                  Override config.serverUrl\n  --receipt-log <path>         Redacted JSONL evidence path\n  --stdout-log <path>          Supervisor stdout path\n  --stderr-log <path>          Supervisor stderr path\n  --keychain-service <name>    macOS token service\n  --token-file <path>          Mode-0600 token file\n  --credential-file <path>     Mode-0600 credentials for session refresh\n  --label <name>               Override deterministic service label\n  -h, --help                   Show this help\n\nNo JWT, username, or password is written into the service definition.\n`);
+  stream.write(`Usage: node scripts/swarm-service.mjs <command> --config <json> [options]\n\nInstalls and operates a launchd or systemd-user service for one SWARM host.\n\nCommands:\n  install          Install and start the service\n  uninstall        Stop and remove the service\n  start            Start the installed service\n  stop             Stop the service\n  restart          Restart the service\n  status           Print service state\n  plan-update      Preview an exact shared-bridge artifact update without applying it\n  print-service    Print the native service definition\n  print-plist      Alias for macOS compatibility\n  print-unit       Alias for Linux compatibility\n  self-test        Validate service safety offline\n\nOptions:\n  --config <path>              Machine SWARM configuration\n  --url <url>                  Override config.serverUrl\n  --receipt-log <path>         Redacted JSONL evidence path\n  --stdout-log <path>          Supervisor stdout path\n  --stderr-log <path>          Supervisor stderr path\n  --keychain-service <name>    macOS token service\n  --token-file <path>          Mode-0600 token file\n  --credential-file <path>     Mode-0600 credentials for session refresh\n  --label <name>               Override deterministic service label\n  -h, --help                   Show this help\n\nNo JWT, username, or password is written into the service definition.\n`);
   process.exit(exitCode);
 }
 
@@ -40,7 +40,7 @@ function parseArgs(argv) {
   const command = argv[0];
   const commands = new Set([
     "install", "uninstall", "start", "stop", "restart", "status",
-    "print-service", "print-plist", "print-unit", "self-test",
+    "print-service", "print-plist", "print-unit", "plan-update", "self-test",
   ]);
   if (!commands.has(command)) throw new Error(`Unknown command: ${command}`);
   const options = { command };
@@ -100,11 +100,13 @@ function systemdArg(value) {
   return `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%")}"`;
 }
 
-function loadConfig(configPath) {
+function loadConfig(configPath, { bounded = false } = {}) {
   if (!configPath) throw new Error("--config is required");
   const resolved = expandPath(configPath);
   if (!fs.existsSync(resolved)) throw new Error(`SWARM config not found: ${resolved}`);
-  const config = JSON.parse(fs.readFileSync(resolved, "utf8"));
+  const config = JSON.parse(bounded
+    ? readPreviewFile(resolved, "SWARM configuration").toString("utf8")
+    : fs.readFileSync(resolved, "utf8"));
   if (!config.machineId || !Array.isArray(config.agents) || config.agents.length === 0) {
     throw new Error("SWARM config requires machineId and at least one agent");
   }
@@ -315,6 +317,89 @@ function serviceDefinition(spec) {
   throw new Error("Supervised service installation supports macOS launchd and Linux systemd-user");
 }
 
+// Preview is filesystem observation only. Its digest is neither authorization
+// nor a claim about the process currently loaded by the native supervisor.
+function readPreviewFile(filePath, label) {
+  const limit = 1024 * 1024;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new Error(`${label} is missing or not installed`);
+    if (error?.code === "ELOOP") throw new Error(`${label} must be a regular file`);
+    throw error;
+  }
+  try {
+    const before = fs.fstatSync(fd);
+    if (!before.isFile()) throw new Error(`${label} must be a regular file`);
+    if (before.size > limit) throw new Error(`${label} exceeds the preview size limit`);
+    const buffer = Buffer.alloc(before.size + 1);
+    let count = 0;
+    while (count < buffer.length) {
+      const received = fs.readSync(fd, buffer, count, buffer.length - count, null);
+      if (received === 0) break;
+      count += received;
+    }
+    const after = fs.fstatSync(fd);
+    if (count !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+      throw new Error(`${label} changed while preparing its preview`);
+    }
+    return buffer.subarray(0, count);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function serviceUpdatePlan(spec, { sourceRoot = SCRIPT_DIR } = {}) {
+  if (spec.label !== `${LABEL_PREFIX}.${safeToken(spec.machineId, "machineId")}`) {
+    throw new Error("Update preview requires the canonical shared bridge label");
+  }
+  const configBytes = readPreviewFile(spec.configPath, "SWARM configuration");
+  const config = JSON.parse(configBytes.toString("utf8"));
+  if (config.machineId !== spec.machineId) throw new Error("SWARM update preview host mismatch");
+  if (!Array.isArray(config.agents) || config.agents.length === 0 || config.agents.length > 256) {
+    throw new Error("SWARM update preview requires between 1 and 256 agents (agent limit)");
+  }
+  const affectedAgentIds = config.agents.map((agent) => {
+    const id = safeToken(agent?.agentId, "agent id");
+    if (id.length > 160) throw new Error("SWARM update preview agent id exceeds its limit");
+    return id;
+  }).sort();
+  if (new Set(affectedAgentIds).size !== affectedAgentIds.length) {
+    throw new Error("SWARM update preview has duplicate agent identities");
+  }
+  const currentDefinition = readPreviewFile(spec.servicePath, "Native service definition");
+  const runtimeSha256 = serviceRuntimeDigest(sourceRoot);
+  if (runtimeSha256 !== spec.serviceRuntimeDigest) {
+    throw new Error("SWARM service runtime source changed after service specification");
+  }
+  const digest = (value) => createHash("sha256").update(value).digest("hex");
+  const plan = {
+    schemaVersion: "valkyr-service-update-plan/v1",
+    applied: false,
+    authorized: false,
+    requiresCanonicalApproval: true,
+    expectedMachineId: spec.machineId,
+    serviceHandle: "swarm-bridge",
+    sharedBridge: true,
+    affectedAgentIds,
+    supervisor: spec.platform === "darwin" ? "launchd" : "systemd-user",
+    label: spec.label,
+    serverUrl: safeServerUrl(spec.serverUrl),
+    configuration: { sha256: digest(configBytes) },
+    current: {
+      definitionSha256: digest(currentDefinition),
+      processState: "not-observed",
+    },
+    candidate: {
+      definitionSha256: digest(serviceDefinition(spec)),
+      runtimeSha256,
+      runtimeFileCount: SERVICE_RUNTIME_FILES.length,
+    },
+  };
+  return { ...plan, planSha256: digest(JSON.stringify(plan)) };
+}
+
 function run(executable, args, { allowFailure = false, capture = false } = {}) {
   const result = spawnSync(executable, args, {
     encoding: "utf8",
@@ -424,7 +509,11 @@ function main() {
   if (!["darwin", "linux"].includes(process.platform)) {
     throw new Error("Use swarm-activate --foreground on platforms without launchd or systemd-user");
   }
-  const spec = serviceSpec(options, loadConfig(options.config));
+  const spec = serviceSpec(options, loadConfig(options.config, { bounded: options.command === "plan-update" }));
+  if (options.command === "plan-update") {
+    process.stdout.write(`${JSON.stringify(serviceUpdatePlan(spec), null, 2)}\n`);
+    return;
+  }
   if (["print-service", "print-plist", "print-unit"].includes(options.command)) {
     process.stdout.write(serviceDefinition(spec));
     return;
@@ -453,6 +542,7 @@ export {
   serviceDefinition,
   serviceRuntimeDigest,
   serviceSpec,
+  serviceUpdatePlan,
   stageServiceRuntime,
   systemdUnit,
 };
