@@ -526,7 +526,9 @@ function main() {
   if (options.command === "status") return status(spec);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// Node resolves the module URL through symlinks, while argv retains the path
+// used to launch it (including macOS /var aliases and installed CLI links).
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   try {
     main();
   } catch (error) {

@@ -39,6 +39,15 @@ test("CLI exposes a read-only update preview", () => {
   assert.equal(service.parseArgs(["plan-update", "--config", "/private/agent.json"]).command, "plan-update");
 });
 
+test("the packaged CLI executes when launched through a symbolic path", (t) => {
+  const { root } = fixture(t);
+  const alias = path.join(root, "swarm-service-alias.mjs");
+  fs.symlinkSync(fileURLToPath(new URL("../scripts/swarm-service.mjs", import.meta.url)), alias);
+  const result = spawnSync(process.execPath, [alias, "self-test"], { encoding: "utf8", timeout: 1000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Valkyr SWARM service self-test passed/);
+});
+
 for (const platform of ["darwin", "linux"]) {
   test(`${platform} preview pins the actual files and shared-agent impact without staging`, (t) => {
     const { spec, plan } = fixture(t, platform);
