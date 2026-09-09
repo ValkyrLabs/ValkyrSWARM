@@ -352,7 +352,14 @@ async function diagnose(options = {}) {
   let live = null;
   if (options.live && config) {
     try {
-      const client = new ValkyrSwarmClient({ env: { ...process.env, VALKYR_API_BASE: config.serverUrl } });
+      // Inspect the same secure stores used by the local authentication check.
+      const client = new ValkyrSwarmClient({ env: {
+        ...process.env,
+        VALKYR_API_BASE: config.serverUrl,
+        VALKYR_KEYCHAIN_SERVICE: keychainService,
+        VALKYR_SWARM_TOKEN_FILE: tokenFile,
+        VALKYR_SWARM_CREDENTIAL_FILE: credentialFile,
+      } });
       const snapshot = await client.agentsSnapshot();
       const registry = snapshot?.registry && typeof snapshot.registry === "object" ? snapshot.registry : {};
       const registered = registeredAgentEvidence(agents, registry);
