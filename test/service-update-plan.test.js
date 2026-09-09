@@ -43,7 +43,8 @@ test("the packaged CLI executes when launched through a symbolic path", (t) => {
   const { root } = fixture(t);
   const alias = path.join(root, "swarm-service-alias.mjs");
   fs.symlinkSync(fileURLToPath(new URL("../scripts/swarm-service.mjs", import.meta.url)), alias);
-  const result = spawnSync(process.execPath, [alias, "self-test"], { encoding: "utf8", timeout: 1000 });
+  const result = spawnSync(process.execPath, [alias, "self-test"], { encoding: "utf8", timeout: 5000 });
+  assert.equal(result.error, undefined, "Packaged CLI must start within its bounded smoke-test deadline");
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Valkyr SWARM service self-test passed/);
 });

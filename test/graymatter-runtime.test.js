@@ -373,13 +373,13 @@ test("credit-gated receipts enter a private replay queue and later persist", asy
       apiBase: "https://api-0.valkyrlabs.com/v1",
       tokenProvider: async () => "fresh-token",
       replayDir,
-      fetchImpl: async () => new Response(JSON.stringify({ id: "memory-replayed" }), {
+      fetchImpl: async () => new Response(JSON.stringify({ id: "12345678-1234-4234-8234-123456789abc" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }),
     });
     assert.deepEqual(replayed.map(({ id, status }) => ({ id, status })), [
-      { id: "memory-replayed", status: "persisted" },
+      { id: "12345678-1234-4234-8234-123456789abc", status: "persisted" },
     ]);
     assert.deepEqual(fs.readdirSync(replayDir), []);
   } finally {
