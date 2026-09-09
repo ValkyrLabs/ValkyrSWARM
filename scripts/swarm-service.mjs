@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -534,6 +534,241 @@ function stageServiceUpdate(spec, { expectedPlanSha256, sourceRoot = SCRIPT_DIR 
   };
 }
 
+const UPDATE_ACTION = "service.lifecycle.update";
+const UPDATE_RECOVERY_SCHEMA = "valkyr-service-update-recovery/v1";
+const updateHash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+// Internal transaction primitives, deliberately absent from the CLI and agent
+// capability advertisement. Their caller must supply the authenticated,
+// server-approved command and an independent supervisor worker. A receipt-shaped
+// string from chat is not authority. Dispatch, draining, native proof and the
+// existing terminal GrayMatter receipt path must be wired before public use.
+function validateUpdateWire(wire, plan) {
+  const payload = wire?.command?.payload;
+  if (wire?.action !== UPDATE_ACTION || wire.command?.action !== UPDATE_ACTION
+      || wire.command?.requiresApproval !== true
+      || !/^gm_approval_[a-f0-9]{64}$/.test(wire.command?.approvalRef ?? "")) {
+    throw new Error("Artifact update requires canonical content-bound approval authority");
+  }
+  if (!payload || Object.getPrototypeOf(payload) !== Object.prototype
+      || Object.keys(payload).sort().join(",") !== "expectedMachineId,planSha256,serviceHandle") {
+    throw new Error("Artifact update payload must contain only the reviewed plan and semantic target");
+  }
+  if (payload.planSha256 !== plan.planSha256 || payload.expectedMachineId !== plan.expectedMachineId
+      || payload.serviceHandle !== "swarm-bridge"
+      || !plan.affectedAgentIds.includes(wire.targetInstanceId)
+      || !/^[A-Za-z0-9._:-]{1,160}$/.test(wire.commandId ?? "")) {
+    throw new Error("Artifact update plan, host, handle or target authority mismatch");
+  }
+}
+
+function updateDirectory(components, { create = false } = {}) {
+  let directory = fs.realpathSync(os.homedir());
+  verifyStageDirectory(directory);
+  for (const component of components) {
+    directory = path.join(directory, component);
+    if (create) {
+      try { fs.mkdirSync(directory, { mode: 0o700 }); }
+      catch (error) { if (error?.code !== "EEXIST") throw error; }
+    }
+    verifyStageDirectory(directory);
+  }
+  return directory;
+}
+
+function validateUpdatePaths(spec) {
+  const home = fs.realpathSync(os.homedir());
+  const native = spec.platform === "darwin" ? ["Library", "LaunchAgents"] : [".config", "systemd", "user"];
+  const extension = spec.platform === "darwin" ? ".plist" : ".service";
+  if (!["darwin", "linux"].includes(spec.platform)
+      || spec.label !== `${LABEL_PREFIX}.${safeToken(spec.machineId, "machineId")}`
+      || spec.servicePath !== path.join(home, ...native, `${spec.label}${extension}`)
+      || !/^[a-f0-9]{64}$/.test(spec.serviceRuntimeDigest)
+      || spec.serviceRuntimeRoot !== path.join(home, ".local", "share", "valkyr-swarm", "service-runtimes", spec.serviceRuntimeDigest)
+      || spec.agentScript !== path.join(spec.serviceRuntimeRoot, "swarm-agent.mjs")) {
+    throw new Error("Artifact update requires canonical native and runtime paths");
+  }
+  updateDirectory(native);
+}
+
+function updatePrivateBytes(file, { readonly = false } = {}) {
+  const bytes = readPreviewFile(file, "Private update recovery file", { limit: 1024 * 1024 });
+  const stat = fs.lstatSync(file);
+  if (stat.uid !== process.getuid() || stat.nlink !== 1 || (stat.mode & 0o077) !== 0
+      || (readonly && (stat.mode & 0o777) !== 0o400)) {
+    throw new Error("Update recovery requires private read-only files without links");
+  }
+  return bytes;
+}
+
+function updateRecoveryDirectory(spec, { createParent = false } = {}) {
+  const root = updateDirectory([".config", "valkyr-swarm", "service-recovery"], { create: createParent });
+  return path.join(root, `${spec.label}.update`);
+}
+
+function writeUpdateRecord(directory, record, previous) {
+  const target = path.join(directory, "record.json");
+  if (previous && updatePrivateBytes(target, { readonly: true }).toString() !== `${JSON.stringify(previous)}\n`) {
+    throw new Error("Update recovery checkpoint changed before persistence");
+  }
+  const temporary = path.join(directory, `${randomUUID()}.tmp`);
+  try {
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
+    if (bytes.length > 128 * 1024) throw new Error("Update recovery checkpoint exceeds its size limit");
+    writeCandidateFile(temporary, bytes);
+    fs.renameSync(temporary, target);
+    syncDirectory(directory);
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
+
+function replaceUpdateDefinition(spec, expectedSha256, bytes, validateCurrent = () => {}) {
+  validateUpdatePaths(spec);
+  if (updateHash(updatePrivateBytes(spec.servicePath)) !== expectedSha256) {
+    throw new Error("Native definition changed before artifact replacement");
+  }
+  const temporary = `${spec.servicePath}.${randomUUID()}.tmp`;
+  try {
+    writeCandidateFile(temporary, bytes);
+    fs.chmodSync(temporary, 0o600);
+    validateUpdatePaths(spec);
+    validateCurrent();
+    if (updateHash(updatePrivateBytes(spec.servicePath)) !== expectedSha256) {
+      throw new Error("Native definition changed at artifact replacement");
+    }
+    fs.renameSync(temporary, spec.servicePath);
+    syncDirectory(path.dirname(spec.servicePath));
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
+
+function updateResult(record, recoveryDirectory) {
+  return {
+    schemaVersion: UPDATE_RECOVERY_SCHEMA,
+    applied: !record.phase.startsWith("rollback"),
+    rolledBack: record.phase === "rollback_awaiting_recovery",
+    completed: false,
+    pendingRecovery: true,
+    phase: record.phase,
+    commandId: record.commandId,
+    planSha256: record.plan.planSha256,
+    affectedAgentIds: record.plan.affectedAgentIds,
+    recoveryDirectory,
+  };
+}
+
+async function applyStagedServiceUpdate(spec, { wire, assertIdle, reload, sourceRoot = SCRIPT_DIR } = {}) {
+  if (typeof assertIdle !== "function" || typeof reload !== "function") {
+    throw new Error("Artifact update requires active-lease and independent supervisor adapters");
+  }
+  validateUpdatePaths(spec);
+  const plan = serviceUpdatePlan(spec, { sourceRoot });
+  validateUpdateWire(wire, plan);
+  const candidate = path.join(candidateParent(), plan.planSha256);
+  const definition = serviceDefinition(spec);
+  const verify = () => {
+    validateUpdatePaths(spec);
+    validateUpdateWire(wire, plan);
+    if (serviceUpdatePlan(spec, { sourceRoot }).planSha256 !== plan.planSha256) {
+      throw new Error("Artifact update plan changed before activation");
+    }
+    verifyCandidate(candidate, plan, definition);
+  };
+  verify();
+  if (await assertIdle([...plan.affectedAgentIds]) !== true) {
+    throw new Error("Shared-agent active leases prevent artifact update; idle proof is required");
+  }
+  verify();
+  const directory = updateRecoveryDirectory(spec, { createParent: true });
+  try { fs.mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) {
+    if (error?.code === "EEXIST") throw new Error("A pending artifact update requires recovery before another apply");
+    throw error;
+  }
+  // The durable directory is also the per-bridge exclusion fence. Never remove
+  // it on uncertain outcomes; recovery/terminal receipt reconciliation owns it.
+  syncDirectory(path.dirname(directory));
+  const original = updatePrivateBytes(spec.servicePath);
+  if (updateHash(original) !== plan.current.definitionSha256) throw new Error("Native definition changed before rollback checkpoint");
+  writeCandidateFile(path.join(directory, "rollback-definition"), original);
+  let record = {
+    schemaVersion: UPDATE_RECOVERY_SCHEMA, phase: "prepared", createdAt: new Date().toISOString(),
+    action: wire.action, commandId: wire.commandId, targetInstanceId: wire.targetInstanceId,
+    approvalRef: wire.command.approvalRef, plan,
+  };
+  writeUpdateRecord(directory, record);
+  updateDirectory([".local", "share", "valkyr-swarm", "service-runtimes"], { create: true });
+  stageServiceRuntime(spec, path.join(candidate, "runtime"));
+  const verifyInstalled = () => {
+    verifyStageDirectory(spec.serviceRuntimeRoot, 0o700);
+    if (JSON.stringify(fs.readdirSync(spec.serviceRuntimeRoot).sort()) !== JSON.stringify([...SERVICE_RUNTIME_FILES].sort())
+        || serviceRuntimeDigest(spec.serviceRuntimeRoot) !== plan.candidate.runtimeSha256) {
+      throw new Error("Installed candidate runtime inventory verification failed");
+    }
+    for (const name of SERVICE_RUNTIME_FILES) updatePrivateBytes(path.join(spec.serviceRuntimeRoot, name));
+  };
+  verifyInstalled();
+  verify();
+  replaceUpdateDefinition(spec, plan.current.definitionSha256, definition, () => { verify(); verifyInstalled(); });
+  const advance = (phase) => {
+    const next = { ...record, phase };
+    writeUpdateRecord(directory, next, record);
+    record = next;
+  };
+  advance("activation_started");
+  const dispatched = await reload({ operation: "activate", supervisor: plan.supervisor, label: spec.label,
+    definitionPath: spec.servicePath, expectedDefinitionSha256: plan.candidate.definitionSha256,
+    plan, recoveryDirectory: directory });
+  if (dispatched?.accepted !== true) throw new Error("Supervisor activation outcome is uncertain; recovery required");
+  advance("awaiting_recovery");
+  return updateResult(record, directory);
+}
+
+async function rollbackServiceUpdate(spec, { wire, reload } = {}) {
+  if (typeof reload !== "function") throw new Error("Rollback requires an independent supervisor adapter");
+  validateUpdatePaths(spec);
+  const directory = updateRecoveryDirectory(spec);
+  verifyStageDirectory(directory, 0o700);
+  let record = JSON.parse(updatePrivateBytes(path.join(directory, "record.json"), { readonly: true }));
+  const { planSha256, ...planBody } = record.plan ?? {};
+  if (record.schemaVersion !== UPDATE_RECOVERY_SCHEMA || updateHash(JSON.stringify(planBody)) !== planSha256
+      || record.plan.expectedMachineId !== spec.machineId || record.plan.label !== spec.label) {
+    throw new Error("Update recovery plan verification failed");
+  }
+  validateUpdateWire(wire, record.plan);
+  if (wire.commandId !== record.commandId || wire.targetInstanceId !== record.targetInstanceId
+      || wire.command.approvalRef !== record.approvalRef || wire.action !== record.action) {
+    throw new Error("Update recovery authority does not match the original command");
+  }
+  if (!["prepared", "activation_started", "awaiting_recovery", "rollback_prepared"].includes(record.phase)) {
+    throw new Error("Rollback already started or has an uncertain outcome; inspect pending recovery");
+  }
+  const verifyConfiguration = () => {
+    if (updateHash(readPreviewFile(spec.configPath, "SWARM configuration")) !== record.plan.configuration.sha256) {
+      throw new Error("Configuration changed before rollback");
+    }
+  };
+  verifyConfiguration();
+  const original = updatePrivateBytes(path.join(directory, "rollback-definition"), { readonly: true });
+  if (updateHash(original) !== record.plan.current.definitionSha256) throw new Error("Rollback definition verification failed");
+  const current = updateHash(updatePrivateBytes(spec.servicePath));
+  if (![record.plan.current.definitionSha256, record.plan.candidate.definitionSha256].includes(current)) {
+    throw new Error("Native definition changed to unrecognized bytes; rollback will not overwrite it");
+  }
+  const advance = (phase) => {
+    const next = { ...record, phase };
+    writeUpdateRecord(directory, next, record);
+    record = next;
+  };
+  if (record.phase !== "rollback_prepared") advance("rollback_prepared");
+  replaceUpdateDefinition(spec, current, original, verifyConfiguration);
+  advance("rollback_reload_started");
+  const dispatched = await reload({ operation: "rollback", supervisor: record.plan.supervisor, label: spec.label,
+    definitionPath: spec.servicePath, expectedDefinitionSha256: record.plan.current.definitionSha256,
+    plan: record.plan, recoveryDirectory: directory });
+  if (dispatched?.accepted !== true) throw new Error("Supervisor rollback outcome is uncertain; recovery required");
+  advance("rollback_awaiting_recovery");
+  return updateResult(record, directory);
+}
+
 function run(executable, args, { allowFailure = false, capture = false } = {}) {
   const result = spawnSync(executable, args, {
     encoding: "utf8",
@@ -677,8 +912,10 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(file
 
 export {
   SERVICE_RUNTIME_FILES,
+  applyStagedServiceUpdate,
   parseArgs,
   plist,
+  rollbackServiceUpdate,
   serviceDefinition,
   serviceRuntimeDigest,
   serviceSpec,
