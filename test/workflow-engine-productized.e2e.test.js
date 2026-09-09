@@ -1,3 +1,4 @@
+import { workflowEngineTransportHeaders } from "../scripts/swarm-workflow-transport.mjs";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -284,6 +285,16 @@ test("productized service invocation boots, advertises, and executes the durable
   const health = await waitForHealth(healthUrl, child);
   agent.runtime = "codex";
   agent.capacity = 1;
+  // Real HTTP security chain: anonymous callers cannot read private replay, erase
+  // its cursor, cancel a run, or submit an action. Public health remains readable.
+  for (const [method, suffix] of [["GET", "events"], ["POST", "events/ack"],
+    ["POST", "execute"], ["POST", "executions/unknown/kill"], ["POST", "executions/unknown/control"]]) {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/${suffix}`, {
+      method, redirect: "error", ...(method === "POST" ? { body: "{}", headers: { "Content-Type": "application/json" } } : {}),
+    });
+    assert.equal(response.status, 401, `${method} ${suffix} must require node transport authority`);
+    await response.body?.cancel();
+  }
   const state = await probeWorkflowRuntime(agent);
   const metadata = workflowRunnerMetadata(agent, state);
   assert.equal(state.healthy, true);
@@ -388,13 +399,13 @@ test("productized service invocation boots, advertises, and executes the durable
   assert.equal(completion.terminalState, "SUCCESS");
   assert.equal(completion.finalState.answer, 42);
   assert.equal(completion.finalState.productized, true);
-  const events = await fetch(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/events?after=0&limit=100`)
+  const events = await fetch(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/events?after=0&limit=100`, { headers: workflowEngineTransportHeaders(agent), redirect: "error" })
     .then((response) => response.json());
   assert.equal(events.events.some((event) => event.eventType === "SUCCESS"), true);
   assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
 });
 
-test("productized durable engine suspends an outbound pack and resumes only with mothership approval", {
+test("productized durable engine never substitutes an approval boolean for a signed outbound grant", {
   skip: !artifact || !openClawGtmPack,
   timeout: 90_000,
 }, async (context) => {
@@ -547,6 +558,7 @@ test("productized durable engine suspends an outbound pack and resumes only with
     abiHash: "d".repeat(64),
     definitionSnapshot,
     initialState: {
+      retryLimit: 0,
       input: { audience: "acceptance-only" },
       context: { source: "bounded-productized-e2e" },
       idempotencyKey: "bounded-productized-e2e",
@@ -612,21 +624,15 @@ test("productized durable engine suspends an outbound pack and resumes only with
       approved: true,
     },
   };
-  const resumed = await execute("engine-approval-resume-e2e");
-  assert.equal(resumed.executed, true);
-  assert.equal(completions.at(-1).terminalState, "SUCCESS");
-  assert.equal(openClawRequests.length, 1);
-  assert.deepEqual(openClawRequests[0], {
-    method: "POST",
-    path: "/api/skills/execute",
-    body: {
-      skill: "outreach-send",
-      operation: "outreach.send",
-      input: { audience: "acceptance-only" },
-      context: { source: "bounded-productized-e2e" },
-      idempotencyKey: "bounded-productized-e2e",
-    },
-  });
+  await assert.rejects(execute("engine-approval-resume-e2e"), /server-signed tenant capability grant/);
+  assert.equal(completions.at(-1).terminalState, "FAILED");
+  assert.equal(openClawRequests.length, 0);
+  const replay = await fetch(`http://127.0.0.1:${port}/v1/swarm/workflow-engine/events?after=0&limit=100`, {
+    headers: workflowEngineTransportHeaders(agent), redirect: "error",
+  }).then((response) => response.json());
+  assert.ok(replay.events.some((event) => event.eventType === "MODULE_FAILED"
+    && /server-signed tenant capability grant/.test(event.payload?.error ?? "")));
+  assert.equal(replay.events.some((event) => event.eventType === "CAPABILITY_GRANT_CONSUMED"), false);
   assert.doesNotMatch(runtimeLog, /STARTING VALKYRAI APPLICATION|entityManagerFactory|OrganizationContextResolver|Transactional email readiness|Java heap space|valkyrai-startup-spinner/);
 });
 

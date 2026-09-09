@@ -26,6 +26,7 @@ import {
 } from "./swarm-auth.mjs";
 import {
   hydrateRuntimeGrayMatterContext,
+  commandReceiptFingerprint,
   persistCommandReceipt,
   persistWorkflowHandoff,
   replayQueuedReceipts,
@@ -43,6 +44,8 @@ import {
   SERVICE_RESTART_ACTION,
   SERVICE_STATUS_ACTION,
   buildServiceLifecycleState,
+  checkpointServiceRecoveryTerminal,
+  checkpointServiceRecoveryReceipt,
   executeServiceLifecycleCommand,
   readPendingRecoveries,
   removePendingRecovery,
@@ -154,21 +157,38 @@ function createTokenProvider(
   } = {},
 ) {
   let initialToken = configuredToken;
-  return async ({ forceRefresh = false } = {}) => {
+  let refreshInFlight = null;
+  return async ({ forceRefresh = false, rejectedToken } = {}) => {
     if (!forceRefresh) {
       if (initialToken) return initialToken;
       const storedToken = keychainReader(keychainService) ?? fileReader(tokenFile);
       if (storedToken) return storedToken;
+    } else if (typeof rejectedToken === "string" && rejectedToken) {
+      // Another authorized client may already have replaced the secure session.
+      // Compare against this socket's rejected token, never a healthy peer's last read.
+      const storedToken = keychainReader(keychainService) ?? fileReader(tokenFile);
+      if (storedToken && storedToken !== rejectedToken) {
+        initialToken = null;
+        return storedToken;
+      }
     }
+    if (refreshInFlight) return refreshInFlight;
     const credentials = credentialReader({ keychainService, credentialFile });
     if (!credentials?.username || !credentials?.password) {
       if (forceRefresh) throw new Error("Authentication expired and no reusable username/password is available");
       return null;
     }
-    const token = await login({ ...credentials, apiBase });
-    persist({ token, ...credentials, keychainService, tokenFile, credentialFile });
-    initialToken = null;
-    return token;
+    refreshInFlight = (async () => {
+      const token = await login({ ...credentials, apiBase });
+      persist({ token, ...credentials, keychainService, tokenFile, credentialFile });
+      initialToken = null;
+      return token;
+    })();
+    try {
+      return await refreshInFlight;
+    } finally {
+      refreshInFlight = null;
+    }
   };
 }
 
@@ -532,6 +552,38 @@ function journalQuarantineResponse(wire, adapter) {
   };
 }
 
+function validateServiceRecoveryTerminal(terminal, wire, record) {
+  const result = terminal?.result;
+  const success = terminal?.type === "ACK" && terminal?.status === "completed";
+  const failure = terminal?.type === "NACK" && terminal?.status === "failed";
+  const expectedStatus = success ? "SUCCEEDED" : "FAILED";
+  const validated = runtimeTerminalResponse(result, wire);
+  const proof = result?.proof;
+  if ((!success && !failure) || result?.adapter !== "native-service-lifecycle"
+      || result?.serviceHandle !== record.serviceHandle || result?.pendingRecovery !== false
+      || result?.receiptOnly !== false || result?.executed !== success
+      || result?.outcome?.approvalRef !== wire.command.approvalRef
+      || validated.result?.outcome?.status !== expectedStatus
+      || (success && (proof?.healthy !== true || proof?.heartbeatFresh !== true
+        || proof?.supervisorRunning !== true || proof?.expectedAgentId !== record.agentId
+        || proof?.handle !== record.serviceHandle
+        || !Number.isFinite(Date.parse(proof?.heartbeatAt))
+        || Date.parse(proof.heartbeatAt) < Date.parse(record.createdAt) - 5_000))) {
+    throw new Error("Saved service recovery outcome does not match its exact command and proof");
+  }
+  return terminal;
+}
+
+function serviceRecoveryWire(record) {
+  return {
+    action: SERVICE_RESTART_ACTION,
+    command: { action: SERVICE_RESTART_ACTION, approvalRef: record.approvalRef,
+      payload: { expectedMachineId: record.expectedMachineId, serviceHandle: record.serviceHandle }, requiresApproval: true },
+    commandId: record.commandId, targetInstanceId: record.targetInstanceId,
+    trace: record.traceId ? { traceId: record.traceId } : {},
+  };
+}
+
 function adapterErrorResponse(wire, adapter, error) {
   const reason = redactedError(error);
   const outcome = governedOutcome(wire, {
@@ -574,6 +626,8 @@ class EvidenceLog {
 }
 
 class SwarmAgent {
+  #connectionToken = null;
+
   constructor({
     agent,
     apiBase,
@@ -605,6 +659,7 @@ class SwarmAgent {
     this.pendingControlMessages = new Map();
     this.forceAuthRefresh = false;
     this.grayMatterReplayActive = false;
+    this.serviceRecoveryActive = false;
     this.workflowRuntimeState = { configured: Boolean(agent.workflowRuntime), healthy: false, status: "unchecked" };
     this.agent.workflowRuntimeState = this.workflowRuntimeState;
     this.workflowEngineEventCursor = 0;
@@ -630,7 +685,11 @@ class SwarmAgent {
     if (this.stopped) return;
     let token;
     try {
-      token = await this.tokenProvider({ forceRefresh: this.forceAuthRefresh });
+      token = await this.tokenProvider({
+        forceRefresh: this.forceAuthRefresh,
+        ...(this.forceAuthRefresh && this.#connectionToken
+          ? { rejectedToken: this.#connectionToken } : {}),
+      });
       this.forceAuthRefresh = false;
     } catch (error) {
       this.evidence.record("auth_unavailable", {
@@ -649,8 +708,10 @@ class SwarmAgent {
       return;
     }
     const websocket = new WebSocket(this.url, ["v12.stomp"]);
+    this.#connectionToken = token;
     this.websocket = websocket;
     websocket.addEventListener("open", () => {
+      if (this.websocket !== websocket || this.stopped) return;
       websocket.send(stompFrame("CONNECT", {
         "accept-version": "1.2",
         host: new URL(this.url).host,
@@ -661,13 +722,17 @@ class SwarmAgent {
         "heart-beat": "10000,10000",
       }));
     });
-    websocket.addEventListener("message", (event) => this.onData(event.data));
+    websocket.addEventListener("message", (event) => {
+      if (this.websocket === websocket && !this.stopped) this.onData(event.data);
+    });
     websocket.addEventListener("error", () => {
-      if (!this.stopped) {
+      if (this.websocket === websocket && !this.stopped) {
         this.evidence.record("socket_error", { agentId: this.agent.agentId });
       }
     });
-    websocket.addEventListener("close", (event) => this.onClose(event));
+    websocket.addEventListener("close", (event) => {
+      if (this.websocket === websocket) this.onClose(event);
+    });
   }
 
   onData(raw) {
@@ -1067,6 +1132,7 @@ class SwarmAgent {
         agentId: this.agent.agentId,
         apiBase: this.apiBase,
         tokenProvider: this.tokenProvider,
+        onPersisted: (result) => this.recordReplayedServiceReceipt(result),
       });
       for (const result of results) {
         this.evidence.record(
@@ -1185,110 +1251,159 @@ class SwarmAgent {
     };
   }
 
+  recordReplayedServiceReceipt(result) {
+    if (result.status !== "persisted" || !result.id) return;
+    for (const pending of readPendingRecoveries({ agentId: this.agent.agentId, recoveryRoot: this.recoveryRoot })) {
+      const record = pending.record;
+      if (!record.terminal || result.sourceMessageId !== `swarm-command:${record.commandId}:${record.terminal.status}`) continue;
+      const wire = serviceRecoveryWire(record);
+      if (record.expectedMachineId !== this.machineId || record.targetInstanceId !== this.agent.agentId) {
+        throw new Error("Replayed service receipt target does not match this node");
+      }
+      validateServiceRecoveryTerminal(record.terminal, wire, record);
+      const expected = commandReceiptFingerprint({ agent: this.agent, wire, response: record.terminal });
+      if (result.bodyFingerprint !== expected) throw new Error("Replayed service receipt does not match the saved outcome");
+      checkpointServiceRecoveryReceipt({ pending, receipt: { status: "persisted", id: result.id }, recoveryRoot: this.recoveryRoot });
+    }
+  }
+
   async reconcilePendingServiceRecoveries() {
-    const pending = readPendingRecoveries({
-      agentId: this.agent.agentId,
-      recoveryRoot: this.recoveryRoot,
-    });
-    for (const item of pending) {
-      const createdAt = Date.parse(item.record.createdAt);
-      const ageMs = Number.isFinite(createdAt) ? Date.now() - createdAt : Number.POSITIVE_INFINITY;
-      const resolved = this.serviceLifecycleState.bindings
-        .find((candidate) => candidate.handle === item.record.serviceHandle);
-      const wire = {
-        action: SERVICE_RESTART_ACTION,
-        command: {
-          action: SERVICE_RESTART_ACTION,
-          approvalRef: item.record.approvalRef,
-          payload: {
-            expectedMachineId: item.record.expectedMachineId,
-            serviceHandle: item.record.serviceHandle,
-          },
-          requiresApproval: true,
-        },
-        commandId: item.record.commandId,
-        targetInstanceId: item.record.targetInstanceId,
-        trace: item.record.traceId ? { traceId: item.record.traceId } : {},
-      };
-      try {
-        if (!resolved) {
-          throw new Error(`Service ${item.record.serviceHandle} is no longer configured`);
-        }
-        const proof = await this.verifyServiceRecovery(
-          resolved,
-          Number.isFinite(createdAt) ? createdAt : Date.now(),
-        );
-        const completed = {
-          type: "ACK",
-          status: "completed",
-          result: {
-            adapter: "native-service-lifecycle",
-            executed: true,
-            pendingRecovery: false,
-            receiptOnly: false,
-            serviceHandle: resolved.handle,
-            supervisor: resolved.supervisor,
-            proof,
-            outcome: serviceRecoveryOutcome(wire, {
-              status: "SUCCEEDED",
-              summary: `Supervised ${resolved.handle} restart completed with fresh heartbeat proof`,
-            }),
-          },
-        };
-        const memoryReceipt = await this.persistTerminalReceipt(wire, completed);
-        completed.result.grayMatterReceiptRef = memoryReceipt.id
-          ? `MemoryEntry:${memoryReceipt.id}` : null;
-        completed.result.grayMatterReceiptStatus = memoryReceipt.status;
-        this.rememberCompleted(wire.commandId, completed);
-        this.sendCommandResponse(wire, completed);
-        removePendingRecovery(item.path, this.recoveryRoot);
-        this.evidence.record("service_recovery_reconciled", {
-          agentId: this.agent.agentId,
-          commandId: wire.commandId,
-          serviceHandle: resolved.handle,
-          heartbeatAt: proof.heartbeatAt,
-        });
-      } catch (error) {
-        if (ageMs < 120_000) {
-          this.evidence.record("service_recovery_pending", {
+    if (this.serviceRecoveryActive) return;
+    this.serviceRecoveryActive = true;
+    try {
+      const pending = readPendingRecoveries({
+        agentId: this.agent.agentId,
+        recoveryRoot: this.recoveryRoot,
+      });
+      for (const item of pending) {
+        const createdAt = Date.parse(item.record.createdAt);
+        const ageMs = Number.isFinite(createdAt) ? Date.now() - createdAt : Number.POSITIVE_INFINITY;
+        const resolved = this.serviceLifecycleState.bindings
+          .find((candidate) => candidate.handle === item.record.serviceHandle);
+        const wire = serviceRecoveryWire(item.record);
+        try {
+          if (item.record.expectedMachineId !== this.machineId
+              || item.record.targetInstanceId !== this.agent.agentId
+              || !Number.isFinite(createdAt)
+              || (resolved && (resolved.machineId !== this.machineId || resolved.agentId !== this.agent.agentId))) {
+            throw new Error("Service recovery checkpoint belongs to a different target or has an invalid timestamp");
+          }
+          let terminal = item.record.terminal;
+          let submitReceipt = false;
+          if (!terminal) {
+            try {
+              if (!resolved) throw new Error(`Service ${item.record.serviceHandle} is no longer configured`);
+              const proof = await this.verifyServiceRecovery(resolved, createdAt);
+              terminal = {
+                type: "ACK",
+                status: "completed",
+                result: {
+                  adapter: "native-service-lifecycle",
+                  executed: true,
+                  pendingRecovery: false,
+                  receiptOnly: false,
+                  serviceHandle: resolved.handle,
+                  supervisor: resolved.supervisor,
+                  proof,
+                  outcome: serviceRecoveryOutcome(wire, {
+                    status: "SUCCEEDED",
+                    summary: `Supervised ${resolved.handle} restart completed with fresh heartbeat proof`,
+                  }),
+                },
+              };
+            } catch (error) {
+              if (ageMs < 120_000) {
+                this.evidence.record("service_recovery_pending", {
+                  agentId: this.agent.agentId,
+                  commandId: wire.commandId,
+                  error: redactedError(error),
+                  serviceHandle: item.record.serviceHandle,
+                });
+                continue;
+              }
+              terminal = {
+                type: "NACK",
+                status: "failed",
+                reason: redactedError(error),
+                result: {
+                  adapter: "native-service-lifecycle",
+                  executed: false,
+                  pendingRecovery: false,
+                  receiptOnly: false,
+                  serviceHandle: item.record.serviceHandle,
+                  outcome: serviceRecoveryOutcome(wire, {
+                    status: "FAILED",
+                    summary: redactedError(error),
+                    retryable: true,
+                  }),
+                },
+              };
+            }
+            validateServiceRecoveryTerminal(terminal, wire, item.record);
+            // Persist the actual observation before projecting it to GrayMatter.
+            // Receipt retries must not re-run the restart or reinterpret later health.
+            item.record = checkpointServiceRecoveryTerminal({ pending: item, terminal, recoveryRoot: this.recoveryRoot });
+            submitReceipt = true;
+          } else {
+            validateServiceRecoveryTerminal(terminal, wire, item.record);
+          }
+          let memoryReceipt = item.record.receipt;
+          if (submitReceipt) {
+            try {
+              memoryReceipt = await this.persistTerminalReceipt(wire, terminal);
+            } catch (error) {
+              memoryReceipt = { status: "degraded", id: null };
+              this.evidence.record("service_recovery_receipt_error", {
+                agentId: this.agent.agentId, commandId: wire.commandId, error: redactedError(error),
+              });
+            }
+            item.record = checkpointServiceRecoveryReceipt({ pending: item,
+              receipt: memoryReceipt ?? { status: "degraded", id: null }, recoveryRoot: this.recoveryRoot });
+            memoryReceipt = item.record.receipt;
+          }
+          const identityValid = typeof memoryReceipt?.id === "string"
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(memoryReceipt.id);
+          if (memoryReceipt?.status !== "persisted" || !identityValid) {
+            this.evidence.record("service_recovery_receipt_pending", {
+              agentId: this.agent.agentId,
+              commandId: wire.commandId,
+              serviceHandle: item.record.serviceHandle,
+              receiptStatus: memoryReceipt?.status ?? "degraded",
+              receiptIdentityValid: identityValid,
+              reason: memoryReceipt?.status === "persisted" ? "persisted_receipt_missing_valid_id" : "receipt_not_persisted",
+            });
+            continue;
+          }
+          const delivered = {
+            ...terminal,
+            result: {
+              ...terminal.result,
+              grayMatterReceiptRef: `MemoryEntry:${memoryReceipt.id}`,
+              grayMatterReceiptStatus: "persisted",
+            },
+          };
+          this.rememberCompleted(wire.commandId, delivered);
+          this.sendCommandResponse(wire, delivered);
+          removePendingRecovery(item.path, this.recoveryRoot);
+          this.evidence.record(terminal.status === "completed" ? "service_recovery_reconciled" : "service_recovery_failed", {
             agentId: this.agent.agentId,
             commandId: wire.commandId,
+            serviceHandle: item.record.serviceHandle,
+            heartbeatAt: terminal.result.proof?.heartbeatAt ?? null,
+            memoryEntryId: memoryReceipt.id,
+          });
+        } catch (error) {
+          // A corrupt or unwritable local checkpoint is never receipt authority.
+          this.evidence.record("service_recovery_checkpoint_pending", {
+            agentId: this.agent.agentId,
+            commandId: item.record.commandId,
             error: redactedError(error),
             serviceHandle: item.record.serviceHandle,
           });
-          continue;
         }
-        const failed = {
-          type: "NACK",
-          status: "failed",
-          reason: redactedError(error),
-          result: {
-            adapter: "native-service-lifecycle",
-            executed: false,
-            pendingRecovery: false,
-            receiptOnly: false,
-            serviceHandle: item.record.serviceHandle,
-            outcome: serviceRecoveryOutcome(wire, {
-              status: "FAILED",
-              summary: redactedError(error),
-              retryable: true,
-            }),
-          },
-        };
-        const memoryReceipt = await this.persistTerminalReceipt(wire, failed);
-        failed.result.grayMatterReceiptRef = memoryReceipt.id
-          ? `MemoryEntry:${memoryReceipt.id}` : null;
-        failed.result.grayMatterReceiptStatus = memoryReceipt.status;
-        this.rememberCompleted(wire.commandId, failed);
-        this.sendCommandResponse(wire, failed);
-        removePendingRecovery(item.path, this.recoveryRoot);
-        this.evidence.record("service_recovery_failed", {
-          agentId: this.agent.agentId,
-          commandId: wire.commandId,
-          error: redactedError(error),
-          serviceHandle: item.record.serviceHandle,
-        });
       }
+    } finally {
+      this.serviceRecoveryActive = false;
     }
   }
 

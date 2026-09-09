@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const transportDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "workflow-runtime-key-"));
+fs.chmodSync(transportDirectory, 0o700);
+const transportKey = path.join(transportDirectory, "engine.key");
+fs.writeFileSync(transportKey, "synthetic-workflow-bridge-key-0123456789", { mode: 0o600 });
+test.after(() => fs.rmSync(transportDirectory, { recursive: true, force: true }));
 
 import {
   WORKFLOW_ENGINE_ACTION,
@@ -20,6 +29,7 @@ const agent = {
   capacity: 1,
   capabilities: ["graymatter.context"],
   workflowRuntime: {
+    install: { engineKeyPath: transportKey },
     endpoint: "http://127.0.0.1:8765/v1/swarm/workflow-runs/execute",
     healthEndpoint: "http://127.0.0.1:8765/v1/swarm/workflow-runs/health",
     capabilities: ["java:17", "execmodule:map-inject"],
@@ -780,7 +790,8 @@ test("local runtime transport failures produce a fenced failure completion", asy
   );
 });
 
-test("durable engine executes an immutable version snapshot and returns checkpoint state", async () => {
+for (const runtimeState of ["WAITING_UNTIL", "WAITING_AUTHORIZATION", "AUTHORIZATION_RECONCILIATION", "RUNNING"]) {
+test(`durable engine handles ${runtimeState} without a false completion`, async () => {
   const calls = [];
   const fetchImpl = async (url, options = {}) => {
     const value = String(url);
@@ -812,7 +823,7 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
         JSON.stringify({
           type: "completed",
           success: true,
-          terminalState: "WAITING_UNTIL",
+          terminalState: runtimeState,
           finalState: { running: true, cycle: 1 },
           checkpointRef: "checkpoint:1",
           waitingUntil: "2026-09-06T17:30:00Z",
@@ -823,7 +834,7 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
   };
 
   const result = await executeWorkflowRuntimeCommand({
-    agent,
+    agent: { ...agent, workflowRuntime: { ...agent.workflowRuntime, tier: "engine" } },
     apiBase: "https://api-0.valkyrlabs.com/v1",
     tokenProvider: async () => "session-token",
     fetchImpl,
@@ -851,6 +862,13 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
 
   assert.equal(result.workflowExecutionId, "execution-1");
   const completion = calls.find((call) => call.url.endsWith("/complete"));
+  if (runtimeState !== "WAITING_UNTIL") {
+    assert.equal(completion, undefined);
+    assert.equal(result.completion, null);
+    assert.equal(result.terminalState, runtimeState);
+    if (runtimeState === "RUNNING") assert.equal(result.status, "execution_active");
+    return;
+  }
   const body = JSON.parse(completion.options.body);
   assert.equal(body.workflowVersionId, "version-1");
   assert.equal(body.definitionSnapshotHash, "c".repeat(64));
@@ -860,3 +878,4 @@ test("durable engine executes an immutable version snapshot and returns checkpoi
   const local = calls.find((call) => call.url.includes("127.0.0.1:8765"));
   assert.equal(JSON.parse(local.options.body).protocol, "valkyr-workflow-engine/v1");
 });
+}

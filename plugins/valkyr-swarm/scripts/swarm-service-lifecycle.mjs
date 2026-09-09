@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 const SERVICE_STATUS_ACTION = "service.lifecycle.status";
 const SERVICE_RESTART_ACTION = "service.lifecycle.restart";
@@ -215,13 +216,17 @@ function probeServiceBinding(bindingValue, {
   }
   const result = runSupervisor(binding, "status", spawnImpl, uid);
   const stdout = String(result.stdout ?? "");
-  const running = binding.supervisor === "launchd"
-    ? result.status === 0
-    : result.status === 0 && /ActiveState=active(?:\r?\n|$)/.test(stdout);
   const pidMatch = binding.supervisor === "launchd"
-    ? /\bpid\s*=\s*(\d+)/.exec(stdout)
-    : /\bMainPID=(\d+)/.exec(stdout);
-  const pid = pidMatch && Number(pidMatch[1]) > 0 ? Number(pidMatch[1]) : null;
+    ? /^\s*pid\s*=\s*(\d+)\s*$/m.exec(stdout)
+    : /^MainPID=(\d+)\r?$/m.exec(stdout);
+  const parsedPid = pidMatch ? Number(pidMatch[1]) : null;
+  const pid = Number.isSafeInteger(parsedPid) && parsedPid > 0 ? parsedPid : null;
+  // A successful lookup proves a loaded job, not a live supervised process.
+  const running = result.status === 0 && pid !== null && (
+    binding.supervisor === "launchd"
+      ? /^\s*state\s*=\s*running\s*$/m.test(stdout)
+      : /^ActiveState=active\r?$/m.test(stdout) && /^SubState=running\r?$/m.test(stdout)
+  );
   return {
     handle: binding.handle,
     installed: true,
@@ -412,19 +417,21 @@ function readPendingRecoveries({
   recoveryRoot = DEFAULT_RECOVERY_ROOT,
 }) {
   if (!fs.existsSync(recoveryRoot)) return [];
+  const rootStat = fs.lstatSync(recoveryRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== process.getuid()
+      || (rootStat.mode & 0o077) !== 0) return [];
   const records = [];
   for (const name of fs.readdirSync(recoveryRoot).filter((entry) => entry.endsWith(".json")).sort()) {
     const target = path.join(recoveryRoot, name);
     try {
-      const stat = fs.statSync(target);
-      if ((stat.mode & 0o077) !== 0) continue;
-      const record = JSON.parse(fs.readFileSync(target, "utf8"));
+      const record = readPrivateRecovery(target);
       if (record?.schemaVersion !== "valkyr-service-recovery/v1"
           || record.agentId !== agentId
           || record.action !== SERVICE_RESTART_ACTION
           || !CANONICAL_APPROVAL_REF.test(String(record.approvalRef ?? ""))
           || !SERVICE_HANDLES.has(record.serviceHandle)
           || !SAFE_ID.test(String(record.commandId ?? ""))
+          || name !== `${record.commandId}.json`
           || !SAFE_ID.test(String(record.targetInstanceId ?? ""))
           || !SAFE_ID.test(String(record.expectedMachineId ?? ""))) {
         continue;
@@ -435,6 +442,75 @@ function readPendingRecoveries({
     }
   }
   return records;
+}
+
+function readPrivateRecovery(target) {
+  const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.uid !== process.getuid() || before.nlink !== 1
+        || (before.mode & 0o077) !== 0 || before.size > 64 * 1024) {
+      throw new Error("Recovery checkpoint must be a bounded private regular file");
+    }
+    const bytes = Buffer.alloc(before.size + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const received = fs.readSync(fd, bytes, count, bytes.length - count, null);
+      if (received === 0) break;
+      count += received;
+    }
+    const after = fs.fstatSync(fd), current = fs.lstatSync(target);
+    if (count !== before.size || after.size !== before.size || after.ctimeMs !== before.ctimeMs
+        || current.isSymbolicLink() || current.dev !== before.dev || current.ino !== before.ino) {
+      throw new Error("Recovery checkpoint changed during inspection");
+    }
+    return JSON.parse(bytes.subarray(0, count).toString("utf8"));
+  } finally { fs.closeSync(fd); }
+}
+
+function checkpointServiceRecoveryTerminal({ pending, terminal, recoveryRoot = DEFAULT_RECOVERY_ROOT }) {
+  const target = pendingRecoveryPath(pending.record.commandId, recoveryRoot);
+  if (path.resolve(target) !== path.resolve(pending.path)
+      || JSON.stringify(readPrivateRecovery(target)) !== JSON.stringify(pending.record)) {
+    throw new Error("Recovery checkpoint changed before outcome persistence");
+  }
+  if (!plainObject(terminal)) throw new Error("Recovery terminal outcome must be an object");
+  const record = { ...pending.record, terminal, receipt: { status: "submission_started", id: null } };
+  writePrivateRecoveryRecord(target, record, recoveryRoot);
+  return record;
+}
+
+function checkpointServiceRecoveryReceipt({ pending, receipt, recoveryRoot = DEFAULT_RECOVERY_ROOT }) {
+  const target = pendingRecoveryPath(pending.record.commandId, recoveryRoot);
+  const current = readPrivateRecovery(target);
+  const { receipt: previousReceipt, ...previous } = pending.record;
+  const { receipt: currentReceipt, ...observed } = current;
+  if (path.resolve(target) !== path.resolve(pending.path)
+      || JSON.stringify(previous) !== JSON.stringify(observed)) {
+    throw new Error("Recovery outcome changed before receipt persistence");
+  }
+  // A replay callback may persist the receipt while the original submitter is
+  // still unwinding. Never downgrade that durable identity to queued/degraded.
+  if (currentReceipt?.status === "persisted"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currentReceipt?.id ?? "")) return current;
+  const record = { ...current, receipt: { status: receipt.status, id: receipt.id ?? null } };
+  writePrivateRecoveryRecord(target, record, recoveryRoot);
+  return record;
+}
+
+function writePrivateRecoveryRecord(target, record, recoveryRoot) {
+  const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
+  if (bytes.length > 64 * 1024) throw new Error("Recovery terminal checkpoint exceeds its size limit");
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, target);
+    const directory = fs.openSync(recoveryRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
 }
 
 function removePendingRecovery(target, recoveryRoot = DEFAULT_RECOVERY_ROOT) {
@@ -529,6 +605,8 @@ export {
   SERVICE_RESTART_ACTION,
   SERVICE_STATUS_ACTION,
   buildServiceLifecycleState,
+  checkpointServiceRecoveryTerminal,
+  checkpointServiceRecoveryReceipt,
   executeServiceLifecycleCommand,
   nativeSupervisor,
   parseServiceLifecyclePayload,

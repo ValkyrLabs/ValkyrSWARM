@@ -275,7 +275,7 @@ test("durable engine refuses to replace a missing key for an existing encrypted 
 
   assert.throws(
     () => prepareRuntimeDirectory(spec),
-    /key is missing for existing journal/,
+    /key is missing for an existing journal/,
   );
   assert.equal(fs.existsSync(spec.engineKeyPath), false);
   fs.rmSync(root, { recursive: true, force: true });

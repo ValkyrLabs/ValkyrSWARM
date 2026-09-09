@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { workflowRuntimeConfig } from "./swarm-workflow-runtime.mjs";
 import { workflowGrantTrustPath } from "./swarm-workflow-trust.mjs";
+import { workflowEngineKeyPath, prepareWorkflowEngineKey } from "./swarm-workflow-transport.mjs";
 
 const LABEL_PREFIX = "com.valkyrlabs.workflow-runtime";
 const WORKFLOW_RUNNER_MAIN = "com.valkyrlabs.workflow.runner.WorkflowRunnerApplication";
@@ -248,8 +249,7 @@ function loadSpec(configPath, agentId, platform = process.platform) {
     ?? path.join("~/.local/share/valkyr-swarm/workflow-runtimes", `${agentId}-data`));
   const runtimeWorkingDirectory = expandPath(install.runtimeWorkingDirectory
     ?? path.join("~/.local/share/valkyr-swarm/workflow-runtimes", `${agentId}-work`));
-  const engineKeyPath = expandPath(install.engineKeyPath
-    ?? path.join("~/.config/valkyr-swarm/workflow-runtimes", `${agentId}.engine-key`));
+  const engineKeyPath = workflowEngineKeyPath(agent);
   const capabilityPackRoot = expandPath(path.join(
     "~/.local/share/valkyr-swarm/workflow-runtimes", `${agentId}-packs`));
   const nodeCapabilities = [...new Set([
@@ -360,26 +360,13 @@ function prepareRuntimeDirectory(spec) {
   fs.mkdirSync(spec.runtimeWorkingDirectory, { recursive: true, mode: 0o700 });
   if (spec.tier !== "engine") return;
   fs.mkdirSync(path.dirname(spec.runtimeDataPath), { recursive: true, mode: 0o700 });
-  fs.mkdirSync(path.dirname(spec.engineKeyPath), { recursive: true, mode: 0o700 });
   if (spec.capabilityPackRoot) {
     fs.mkdirSync(spec.capabilityPackRoot, { recursive: true, mode: 0o700 });
   }
   const journalFiles = [".mv.db", ".trace.db", ".lock.db"]
     .map((suffix) => `${spec.runtimeDataPath}${suffix}`)
     .filter((candidate) => fs.existsSync(candidate));
-  if (!fs.existsSync(spec.engineKeyPath) && journalFiles.length > 0) {
-    throw new Error(
-      `Workflow engine key is missing for existing journal ${journalFiles[0]}; restore the key or quarantine the journal before activation`,
-    );
-  }
-  if (!fs.existsSync(spec.engineKeyPath)) {
-    fs.writeFileSync(spec.engineKeyPath, `${crypto.randomBytes(32).toString("base64url")}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-      flag: "wx",
-    });
-  }
-  fs.chmodSync(spec.engineKeyPath, 0o600);
+  prepareWorkflowEngineKey(spec.engineKeyPath, journalFiles.length > 0);
 }
 
 function serviceDefinition(spec) {

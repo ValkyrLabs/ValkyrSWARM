@@ -6,6 +6,13 @@
 - Agent configuration contains stable machine/runtime identifiers and private credential-file references, never caller-supplied tenant identity.
 - Every command targets one exact registered instance and one advertised capability or supported tool.
 
+## Shared secure-session recovery
+
+- Each reconnect rereads the canonical secure session. On forced refresh, a peer may reuse a different session from the deterministic Keychain account or configured private token file before requiring reusable credentials. An unchanged rejected session never counts as recovery.
+- The comparison belongs to the failing socket. A healthy peer reading the new shared session must not prevent another peer from recovering. Rejected tokens remain private in-process state and never enter evidence, configuration or command receipts.
+- Concurrent credential refreshes share one login and persistence operation; a failed login permits a later retry. Events from replaced sockets cannot invalidate their replacements or schedule recovery for them.
+- Source or package validation does not establish installed health. Governed activation must still prove the exact registered agent, fresh server heartbeat, advertised capabilities and terminal receipt.
+
 ## Governed native service lifecycle
 
 - `service.lifecycle.status` is bounded, read-only inspection. `service.lifecycle.restart` is protected and requires the mothership-injected content-bound `gm_approval_...` reference for the exact target agent, expected machine, and semantic service handle.
@@ -74,3 +81,19 @@ valid substitute for the requested workspace.
 ## Approval
 
 Capability is not authorization. Outbound sends, production deployments, merges, supervised service restarts, and financial, legal, personnel, destructive, irreversible, security-sensitive, or material-spend effects continue through ValkyrAI's canonical correlated human-approval control plane.
+
+## Durable engine local transport
+
+Loopback binding is only network isolation. The engine permits read-only health without a credential; execution, control, cancellation, event replay and acknowledgement require `X-Valkyr-Engine-Authorization`. The bridge derives this value as lowercase hexadecimal HMAC-SHA256 of `valkyr-workflow-engine-transport/v1` using the existing node-owned journal key. The key and API JWT never enter the engine request, config, process arguments, logs or upstream callbacks. Requests carrying this header refuse redirects and remain on the configured engine origin. Transport access does not replace independently pinned materialization signatures, exact action grants or required human approvals.
+
+The bridge and journal read the same configured `workflowRuntime.install.engineKeyPath`, or the canonical per-agent engine-key path. The key must be one owned mode-0600 regular file in an owned mode-0700 directory, containing 32–512 printable ASCII bytes and an optional final LF/CRLF. Reads are bounded, reject symbolic and hard links, and fail closed when the platform cannot establish private file ownership and permissions. Activation never changes an existing key's permissions or replaces a missing key for an existing encrypted journal. Restore the original key or deliberately reconcile storage before activation. The public issuer trust file remains separate and contains public material only.
+
+Update and validate the portable bridge together with an authenticated-transport engine release before activation. A successful public health response does not make a bridge with missing private credentials eligible to advertise engine capabilities. The stateless runner keeps its separate runtime tier and cannot carry durable engine commands.
+
+### Private mapped-action authorization
+
+An engine advertising `workflow.private-authorization:v1` suspends signed admitted actions as `WAITING_AUTHORIZATION`. Its encrypted journal atomically stores the frozen mapped request, exact checkpoint, task-entry continuation and reference-only `AUTHORIZATION_REQUESTED` receipt. The public event envelope advertises `privateAuthorization: v1`; inputs and grant envelopes are available only through authenticated local `/authorizations` discovery and `/executions/{executionId}/authorization` read/delivery routes. Discovery is bounded to 25 pending executions and survives receipt acknowledgement and bridge restarts.
+
+The bridge derives `/v1/vaiworkflow/engine/executions/{executionId}/capability-grant` from the private execution binding and uses only the API JWT there. `WAITING_APPROVAL` retains the canonical approval. Signed `ISSUED` results resume the exact frozen action; `RECONCILIATION_REQUIRED`, including denied/expired/consumed canonical approvals, pauses for review. These waits bypass legacy completion-based approval creation. Ordinary debugger continuation cannot replace private action authority; STOP remains available.
+
+The engine claims its local execution slot before committing verified authority and resumption. Cancellation wins over delivery, completed responses are replay-safe, and consumed effects without a committed successful result pause before remapping or new issuance. Public callbacks and GrayMatter receive references only. Known execution leases are renewed before private replay work, and receipt acknowledgement follows durable private handling. The bounded batch handles its pending executions concurrently, each with its own lease renewal, so a slow or failing issuer or local delivery cannot hold up another execution. Any unresolved exchange still prevents acknowledgement.

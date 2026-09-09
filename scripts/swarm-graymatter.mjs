@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -7,6 +7,7 @@ const DEFAULT_RECEIPT_SOURCE = "valkyr-swarm:receipts";
 const DEFAULT_HANDOFF_SOURCE = "valkyr-swarm:handoff";
 const MAX_MEMORY_TEXT_CHARS = 16_000;
 const GRAYMATTER_REQUEST_TIMEOUT_MS = 60_000;
+const DEFINITIVE_RECEIPT_REJECTIONS = new Set([401, 402, 403]);
 const DEFAULT_REPLAY_DIR = path.join(os.homedir(), ".config", "valkyr-swarm", "graymatter-replay");
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const SENSITIVE_KEY = /(authorization|bearer|cookie|credential|password|private.?key|secret|token|api.?key)/i;
@@ -94,7 +95,11 @@ async function requestGrayMatter({ apiBase, token, pathname, body, fetchImpl = f
       parsed = { message: text.slice(0, 500) };
     }
   }
-  if (!response.ok) throw new Error(`GrayMatter ${pathname} returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`GrayMatter ${pathname} returned HTTP ${response.status}`);
+    error.httpStatus = response.status;
+    throw error;
+  }
   return parsed;
 }
 
@@ -290,6 +295,16 @@ function commandTraceRef(wire, key) {
   return safeReceiptRef(value);
 }
 
+function receiptBodyFingerprint(body) {
+  const parsed = JSON.parse(body.text);
+  const { recordedAt, ...content } = parsed;
+  return createHash("sha256").update(JSON.stringify(content)).digest("hex");
+}
+
+function commandReceiptFingerprint(input) {
+  return receiptBodyFingerprint({ text: boundedText(commandReceiptText(input)) });
+}
+
 function safeReceiptRef(value) {
   if (value === undefined || value === null || String(value).trim() === "") return null;
   const text = String(value).trim();
@@ -431,6 +446,7 @@ async function persistCommandReceipt({
       apiBase,
       body,
       replayDir,
+      submissionUncertain: !DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus),
     });
     return {
       id: null,
@@ -497,6 +513,7 @@ async function persistWorkflowHandoff({
       apiBase,
       body,
       replayDir,
+      submissionUncertain: !DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus),
     });
     return {
       id: null,
@@ -507,7 +524,7 @@ async function persistWorkflowHandoff({
   }
 }
 
-function queueReceiptReplay({ agentId, apiBase, body, replayDir = DEFAULT_REPLAY_DIR }) {
+function queueReceiptReplay({ agentId, apiBase, body, replayDir = DEFAULT_REPLAY_DIR, submissionUncertain = false }) {
   fs.mkdirSync(replayDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(replayDir, 0o700);
   const filename = `${safeTag(agentId)}-${safeTag(body.sourceMessageId)}.json`;
@@ -519,9 +536,9 @@ function queueReceiptReplay({ agentId, apiBase, body, replayDir = DEFAULT_REPLAY
     pathname: "/MemoryEntry/write",
     body,
     queuedAt: new Date().toISOString(),
+    ...(submissionUncertain ? { submissionStarted: true } : {}),
   };
-  fs.writeFileSync(queuePath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.chmodSync(queuePath, 0o600);
+  saveReceiptReplayState(queuePath, record);
   return queuePath;
 }
 
@@ -531,6 +548,7 @@ async function replayQueuedReceipts({
   tokenProvider,
   fetchImpl = fetch,
   replayDir = DEFAULT_REPLAY_DIR,
+  onPersisted = async () => {},
 }) {
   if (!fs.existsSync(replayDir)) return [];
   const token = await tokenProvider();
@@ -546,25 +564,62 @@ async function replayQueuedReceipts({
     }
     if (record.agentId !== agentId || normalizeApiBase(record.apiBase) !== normalizeApiBase(apiBase)) continue;
     try {
-      const memory = await requestGrayMatter({
-        apiBase,
-        token,
-        pathname: "/MemoryEntry/write",
-        body: record.body,
-        fetchImpl,
-      });
+      // Retain the returned identity before downstream completion bookkeeping.
+      // Replaying a receipt that is already persisted must not submit it again.
+      if (!record.persistedMemoryEntryId && (record.submissionStarted || record.persistenceUncertain)) {
+        results.push({ queuePath, id: null, status: record.persistenceUncertain ? "persisted_without_valid_id" : "outcome_uncertain" });
+        continue;
+      }
+      let memory = { id: record.persistedMemoryEntryId };
+      if (!record.persistedMemoryEntryId) {
+        record.submissionStarted = true;
+        saveReceiptReplayState(queuePath, record);
+        memory = await requestGrayMatter({ apiBase, token, pathname: "/MemoryEntry/write", body: record.body, fetchImpl });
+      }
+      if (!MEMORY_ENTRY_ID.test(String(memory?.id ?? ""))) {
+        if (!record.persistenceUncertain) {
+          record.persistenceUncertain = true;
+          saveReceiptReplayState(queuePath, record);
+        }
+        results.push({ queuePath, id: null, status: "persisted_without_valid_id" });
+        continue;
+      }
+      if (!record.persistedMemoryEntryId) {
+        record.persistedMemoryEntryId = memory.id;
+        saveReceiptReplayState(queuePath, record);
+      }
+      const result = { queuePath, id: memory.id, status: "persisted", sourceMessageId: record.body.sourceMessageId,
+        bodyFingerprint: record.body.sourceChannel === DEFAULT_RECEIPT_SOURCE ? receiptBodyFingerprint(record.body) : null };
+      await onPersisted(result);
       fs.unlinkSync(queuePath);
-      results.push({ queuePath, id: memory?.id ?? null, status: "persisted" });
+      results.push(result);
     } catch (error) {
+      // These responses reject the request before creating a MemoryEntry. A
+      // timeout, transport loss, server error or local disk failure is ambiguous.
+      if (!record.persistedMemoryEntryId && DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus)) {
+        record.submissionStarted = false;
+        try { saveReceiptReplayState(queuePath, record); } catch { /* Retain the conservative started marker. */ }
+      }
       results.push({
         queuePath,
-        id: null,
-        status: "queued",
+        id: record.persistedMemoryEntryId ?? null,
+        status: record.persistedMemoryEntryId ? "persisted_pending_delivery" : record.submissionStarted ? "outcome_uncertain" : "queued",
         error: error instanceof Error ? error.message : String(error),
       });
     }
   }
   return results;
+}
+
+function saveReceiptReplayState(queuePath, record) {
+  const temporary = `${queuePath}.${randomUUID()}.state.tmp`;
+  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try { fs.writeFileSync(fd, `${JSON.stringify(record)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, queuePath);
+    const parent = fs.openSync(path.dirname(queuePath), "r");
+    try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  } finally { fs.rmSync(temporary, { force: true }); }
 }
 
 export {
@@ -573,6 +628,7 @@ export {
   boundedText,
   compactCommandResult,
   commandReceiptText,
+  commandReceiptFingerprint,
   persistCommandReceipt,
   persistWorkflowHandoff,
   hydrateRuntimeGrayMatterContext,

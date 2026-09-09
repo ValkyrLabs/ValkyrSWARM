@@ -108,8 +108,12 @@ test("signed server materialization bootstraps public trust independently before
     const thor_keys = crypto.generateKeyPairSync("ed25519");
     const thor_public = thor_keys.publicKey.export({ type: "spki", format: "der" }).toString("base64");
     const thor_trustPath = path.join(thor_root, "trust", "issuer.json");
+    fs.chmodSync(thor_root, 0o700);
+    const thor_keyPath = path.join(thor_root, "engine.key");
+    fs.writeFileSync(thor_keyPath, "synthetic-trust-bridge-node-key-0123456789", { mode: 0o600 });
     const thor_agent = { agentId: "trust-node", workflowRuntime: { enabled: true, tier: "engine",
-      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute", install: { grantTrustPath: thor_trustPath } } };
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      install: { grantTrustPath: thor_trustPath, engineKeyPath: thor_keyPath } } };
     const thor_binding = { protocol: "valkyr-workflow-engine/v1", workflowExecutionId: thor_execution,
       workflowRunnerId: thor_runner, leaseFence: 7, logicalIdempotencyKey: "trust-test", workflowVersionId: crypto.randomUUID(),
       definitionSnapshotHash: "a".repeat(64), initialState: {}, moduleAbiHashes: {}, approvals: {},
@@ -122,6 +126,7 @@ test("signed server materialization bootstraps public trust independently before
     await executeWorkflowRuntimeCommand({ agent: thor_agent, wire: thor_wire, apiBase: "https://api.example.test/v1",
       tokenProvider: async () => "private-test-session", fetchImpl: async (thor_url, thor_options) => {
         const thor_path = new URL(thor_url).pathname;
+        assert.equal(Boolean(thor_options.headers["X-Valkyr-Engine-Authorization"]), thor_path.endsWith("/execute"));
         if (thor_path.includes("/grant-trust/")) {
           assert.equal(thor_options.method, "GET");
           assert.equal(thor_options.redirect, "error");

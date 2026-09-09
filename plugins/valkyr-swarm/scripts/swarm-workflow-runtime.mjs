@@ -1,4 +1,5 @@
 import { bootstrapWorkflowGrantTrust } from "./swarm-workflow-trust.mjs";
+import { workflowEngineTransportHeaders } from "./swarm-workflow-transport.mjs";
 
 const WORKFLOW_RUNNER_ACTION = "workflow.runner.execute-module";
 const WORKFLOW_ENGINE_ACTION = "workflow.engine.execute-workflow";
@@ -126,6 +127,9 @@ function workflowRuntimeConfig(agent) {
       "workflowRuntime.eventsEndpoint",
     )
     : null;
+  if (tier === "engine" && (eventsEndpoint.origin !== endpoint.origin || healthEndpoint.origin !== endpoint.origin)) {
+    throw new Error("Workflow engine health and events must use the configured engine origin");
+  }
   const timeoutSeconds = Number(value.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS);
   if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 3600) {
     throw new Error("workflowRuntime.timeoutSeconds must be between 1 and 3600");
@@ -216,12 +220,14 @@ async function forwardWorkflowEngineEventsOnce({
     return { next: Math.max(0, Number(after) || 0), activeExecutions };
   }
   const eventsUrl = new URL(config.eventsEndpoint);
+  const localAuthority = workflowEngineTransportHeaders(agent);
   eventsUrl.searchParams.set("after", String(Math.max(0, Number(after) || 0)));
   eventsUrl.searchParams.set("limit", "100");
   const response = await fetchImpl(eventsUrl, {
     method: "GET",
+    redirect: "error",
     signal: AbortSignal.timeout(10_000),
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", ...localAuthority },
   });
   if (!response.ok) throw new Error(`Local Workflow engine event replay failed with HTTP ${response.status}`);
   const body = await response.json();
@@ -247,7 +253,8 @@ async function forwardWorkflowEngineEventsOnce({
       callbacks,
     };
     const terminal = ["SUCCESS", "FAILED", "CANCELLED"].includes(eventType);
-    const checkpoint = eventType === "CHECKPOINT";
+    const authorizationReconciliation = eventType === "AUTHORIZATION_RECONCILIATION_REQUIRED";
+    const checkpoint = eventType === "CHECKPOINT" || authorizationReconciliation;
     // Correlation identifiers are metadata, not callback transports. Local
     // sandbox/proof executions legitimately retain a command id so duplicate
     // materialization can be detected, but they must never escape the host
@@ -271,7 +278,8 @@ async function forwardWorkflowEngineEventsOnce({
     try {
       if (terminal || checkpoint) {
         const completeUrl = callbackUrl(apiBase, callbacks.complete);
-        const checkpointState = String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType);
+        const checkpointState = authorizationReconciliation ? "PAUSED"
+          : String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType);
         const successful = !["FAILED", "CANCELLED"].includes(checkpointState);
         await authorizedJson(completeUrl, {
           workflowExecutionId: executionId,
@@ -281,7 +289,10 @@ async function forwardWorkflowEngineEventsOnce({
           leaseFence: context.leaseFence,
           success: successful,
           terminalState: checkpointState,
-          finalState: event?.payload?.finalState ?? {},
+          finalState: authorizationReconciliation ? {
+            _workflowAuthorizationRequestId: event?.payload?.authorizationRequestId,
+            _workflowAuthorizationStatus: "RECONCILIATION_REQUIRED",
+          } : (event?.payload?.finalState ?? {}),
           checkpointRef: event?.payload?.checkpointRef ?? null,
           approvalRef: event?.payload?.approvalRef ?? null,
           waitingUntil: event?.payload?.waitingUntil ?? null,
@@ -333,14 +344,19 @@ async function forwardWorkflowEngineEventsOnce({
       }
     }
   }
+  if (body?.privateAuthorization === "v1") {
+    // Renew known leases before private work; ACK only after its durable handling succeeds.
+    await exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenProvider, fetchImpl });
+  }
   if (next > acknowledged) {
     const acknowledgeUrl = new URL(config.eventsEndpoint);
     acknowledgeUrl.search = "";
     acknowledgeUrl.pathname = `${acknowledgeUrl.pathname.replace(/\/$/, "")}/ack`;
     const acknowledgement = await fetchImpl(acknowledgeUrl, {
       method: "POST",
+      redirect: "error",
       signal: AbortSignal.timeout(10_000),
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...localAuthority },
       body: JSON.stringify({ through: next }),
     });
     if (!acknowledgement.ok) {
@@ -374,6 +390,8 @@ async function probeWorkflowRuntime(agent, { fetchImpl = fetch } = {}) {
   const config = workflowRuntimeConfig(agent);
   if (!config) return { configured: false, healthy: false, status: "unsupported" };
   try {
+    // A public health response alone does not prove this bridge can use the installed engine.
+    workflowEngineTransportHeaders(agent);
     const response = await fetchImpl(config.healthEndpoint, {
       method: "GET",
       signal: AbortSignal.timeout(5_000),
@@ -508,7 +526,7 @@ function callbackUrl(apiBase, callback) {
   return result;
 }
 
-async function authorizedJson(url, body, tokenProvider, fetchImpl) {
+async function authorizedJson(url, body, tokenProvider, fetchImpl, { capabilityGrant = false } = {}) {
   const encodedBody = body === undefined ? undefined : JSON.stringify(body);
   const send = async (forceRefresh = false) => {
     const token = await tokenProvider({ forceRefresh });
@@ -523,12 +541,12 @@ async function authorizedJson(url, body, tokenProvider, fetchImpl) {
   };
   let response = await send(false);
   if (response.status === 401 || response.status === 403) response = await send(true);
-  const text = await response.text();
+  const text = capabilityGrant ? await boundedPrivateText(response, 32768) : await response.text();
   let parsed = null;
   if (text) {
     try { parsed = JSON.parse(text); } catch { parsed = { text: text.slice(0, 8_000) }; }
   }
-  if (!response.ok) {
+  if (!response.ok && !(capabilityGrant && response.status === 409 && parsed?.status === "RECONCILIATION_REQUIRED")) {
     throw new RemoteWorkflowCallbackError(
       response.status,
       parsed?.code,
@@ -536,6 +554,98 @@ async function authorizedJson(url, body, tokenProvider, fetchImpl) {
     );
   }
   return parsed;
+}
+
+async function boundedPrivateText(response, limit) {
+  if (Number(response.headers?.get("content-length")) > limit) throw new Error("Private workflow response exceeds its size bound");
+  if (!response.body?.getReader) {
+    const value = await response.text();
+    if (Buffer.byteLength(value, "utf8") > limit) throw new Error("Private workflow response exceeds its size bound");
+    return value;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) { await reader.cancel(); throw new Error("Private workflow response exceeds its size bound"); }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, bytes).toString("utf8");
+  } finally { reader.releaseLock(); }
+}
+
+/** Frozen inputs travel only between the private node journal and the canonical authenticated issuer. */
+async function exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenProvider, fetchImpl = fetch }) {
+  const config = workflowRuntimeConfig(agent);
+  if (config?.tier !== "engine") throw new Error("Private workflow authorization requires an engine");
+  const localAuthority = workflowEngineTransportHeaders(agent);
+  const localBase = new URL(config.endpoint);
+  const localRequest = async (pathname, body) => {
+    const url = new URL(localBase);
+    url.pathname = `/v1/swarm/workflow-engine${pathname}`; url.search = "";
+    const response = await fetchImpl(url, { method: body === undefined ? "GET" : "POST", redirect: "error",
+      headers: { ...localAuthority, Accept: "application/json", "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(body === undefined ? 10000 : 120000),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    if (!response.ok) throw new Error(`Private workflow authorization transport failed with HTTP ${response.status}`);
+    try { return JSON.parse(await boundedPrivateText(response, 147456)); }
+    catch (error) { throw new Error("Private workflow authorization response is invalid"); }
+  };
+  const list = await localRequest("/authorizations");
+  if (!Array.isArray(list?.pending) || list.pending.length > 25) throw new Error("Private workflow authorization discovery is invalid");
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // The discovery limit bounds concurrency. Each execution renews its own lease;
+  // a slow issuer or resumed action must not block the rest of the pending batch.
+  const exchanges = await Promise.allSettled(list.pending.map(async reference => {
+    if (!uuid.test(String(reference?.executionId ?? ""))) throw new Error("Private workflow authorization execution is invalid");
+    const pending = await localRequest(`/executions/${reference.executionId}/authorization`);
+    if (pending?.checkpointRef !== reference.checkpointRef || pending?.requestDigest !== reference.requestDigest) {
+      throw new Error("Private workflow authorization checkpoint changed during discovery");
+    }
+    const request = pending.request;
+    const binding = request?.binding;
+    if (binding?.workflowExecutionId !== reference.executionId || !uuid.test(String(binding?.workflowRunnerId ?? ""))
+        || !uuid.test(String(binding?.authorizationRequestId ?? "")) || !Number.isSafeInteger(binding?.leaseFence) || binding.leaseFence < 1
+        || !request.effectiveInputs || typeof request.effectiveInputs !== "object" || Array.isArray(request.effectiveInputs)
+        || Buffer.byteLength(JSON.stringify(request), "utf8") > 147456) {
+      throw new Error("Private workflow authorization action is invalid");
+    }
+    const canonicalPath = `/v1/vaiworkflow/engine/executions/${binding.workflowExecutionId}`;
+    const heartbeatUrl = callbackUrl(apiBase, `${canonicalPath}/heartbeat/${binding.workflowRunnerId}/${binding.leaseFence}`);
+    await authorizedJson(heartbeatUrl,
+      undefined, tokenProvider, fetchImpl);
+    let heartbeatActive = false;
+    const timer = setInterval(() => {
+      if (heartbeatActive) return;
+      heartbeatActive = true;
+      authorizedJson(heartbeatUrl, undefined, tokenProvider, fetchImpl).catch(() => {})
+        .finally(() => { heartbeatActive = false; });
+    }, Math.max(2000, Math.min(30000, config.leaseDurationSeconds * 1000 / 3)));
+    let result, resumed;
+    try {
+      result = await authorizedJson(callbackUrl(apiBase, `${canonicalPath}/capability-grant`), request,
+        tokenProvider, fetchImpl, { capabilityGrant: true });
+      if (!result || !["ISSUED", "WAITING_APPROVAL", "RECONCILIATION_REQUIRED"].includes(result.status)
+          || result.authorizationRequestId !== binding.authorizationRequestId
+          || (result.status === "ISSUED" ? !result.envelope : result.envelope != null)) {
+        throw new Error("Canonical workflow authorization response does not match the action");
+      }
+      resumed = await localRequest(`/executions/${reference.executionId}/authorization`, {
+        checkpointRef: pending.checkpointRef, requestDigest: pending.requestDigest, result,
+      });
+    } finally { clearInterval(timer); }
+    // Results, progress and GrayMatter handoffs contain references only.
+    return { executionId: reference.executionId, authorizationRequestId: binding.authorizationRequestId,
+      status: result.status, terminalState: resumed?.terminalState ?? null };
+  }));
+  const failures = exchanges.filter(result => result.status === "rejected").length;
+  if (failures) throw new Error(`Private workflow authorization has ${failures} unresolved exchange(s)`);
+  const outcomes = exchanges.map(result => result.value);
+  return { handled: outcomes.length, outcomes };
 }
 
 async function readRuntimeResponse(response, onProgress) {
@@ -577,7 +687,11 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
   const config = workflowRuntimeConfig(agent);
   if (!config) throw new Error("This SWARM node has no local Workflow runtime");
   if (!WORKFLOW_ACTIONS.has(wire.action)) throw new Error(`Unsupported Workflow runtime action: ${wire.action}`);
+  if ((wire.action === WORKFLOW_RUNNER_ACTION) !== (config.tier === "runner")) {
+    throw new Error("Workflow command does not match the configured runtime tier");
+  }
   const payload = wire.command?.payload;
+  const localAuthority = workflowEngineTransportHeaders(agent);
   if (wire.action === WORKFLOW_ENGINE_KILL_ACTION) {
     if (config.tier !== "engine" || !payload?.workflowExecutionId
         || !payload?.workflowRunnerId || !Number.isSafeInteger(Number(payload?.leaseFence))) {
@@ -589,8 +703,10 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     );
     const response = await fetchImpl(killUrl, {
       method: "POST",
+      redirect: "error",
       signal: AbortSignal.timeout(10_000),
       headers: {
+        ...localAuthority,
         Accept: "application/json",
         "X-Valkyr-Swarm-Command-Id": wire.commandId,
       },
@@ -637,8 +753,10 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     );
     const response = await fetchImpl(denialUrl, {
       method: "POST",
+      redirect: "error",
       signal: AbortSignal.timeout(config.timeoutSeconds * 1000),
       headers: {
+        ...localAuthority,
         "Content-Type": "application/json",
         Accept: "application/json, application/x-ndjson",
         "X-Valkyr-Swarm-Command-Id": wire.commandId,
@@ -718,8 +836,10 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     onProgress?.({ stream: "workflow", text: "Workflow engine execution started" });
     const response = await fetchImpl(config.endpoint, {
       method: "POST",
+      redirect: "error",
       signal: AbortSignal.timeout(config.timeoutSeconds * 1000),
       headers: {
+        ...localAuthority,
         "Content-Type": "application/json",
         Accept: "application/json, application/x-ndjson",
         "X-Valkyr-Swarm-Command-Id": wire.commandId,
@@ -768,7 +888,9 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     completion.waitingUntil = result?.waitingUntil ?? null;
     completion.terminalState = String(result?.terminalState ?? (success ? "SUCCESS" : "FAILED"));
   }
-  const completedRun = await authorizedJson(completionUrl, completion, tokenProvider, fetchImpl);
+  const completionDeferred = engineExecution
+    && ["RUNNING", "WAITING_AUTHORIZATION", "AUTHORIZATION_RECONCILIATION"].includes(completion.terminalState);
+  const completedRun = completionDeferred ? null : await authorizedJson(completionUrl, completion, tokenProvider, fetchImpl);
   onProgress?.({
     stream: "workflow",
     text: engineExecution
@@ -780,7 +902,7 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     adapter: "workflow-runtime-http",
     executed: true,
     receiptOnly: false,
-    status: "completed",
+    status: engineExecution && completion.terminalState === "RUNNING" ? "execution_active" : "completed",
     workflowRunId: payload.runId ?? null,
     workflowExecutionId: payload.workflowExecutionId ?? null,
     workflowRunnerId: payload.workflowRunnerId,
@@ -803,6 +925,7 @@ export {
   WORKFLOW_RUNNER_PROTOCOL,
   executeWorkflowRuntimeCommand,
   forwardWorkflowEngineEventsOnce,
+  exchangeWorkflowEngineAuthorizationsOnce,
   loopbackUrl,
   probeWorkflowRuntime,
   supportsWorkflowRuntimeAction,
