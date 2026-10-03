@@ -83,6 +83,8 @@ Options:
   --workflow-runtime-port <n> Loopback runtime port (default 8765)
   --workflow-runtime-max-heap Override the release-recommended bounded heap
   --workflow-credential-refs  Comma-separated node-owned Keychain/systemd references
+  --workflow-integration-accounts Comma-separated authorized IntegrationAccount UUIDs
+  --workflow-privacy-zones   Comma-separated placement zones (internal, confidential)
   --deployment-runner-endpoint Exact node-local deployment runner execute endpoint
   --deployment-credential-ref Optional node-owned deployment credential reference
   --receipt-only              Explicitly disable local execution
@@ -108,6 +110,7 @@ function parseArgs(argv) {
     "--runtime-agent-id", "--runtime-executable", "--workspace",
     "--workflow-artifact-url", "--workflow-artifact-sha256", "--workflow-runtime-port",
     "--workflow-runtime-max-heap", "--workflow-credential-refs",
+    "--workflow-integration-accounts", "--workflow-privacy-zones",
     "--local-model-provider", "--local-model-id", "--local-model-endpoint",
     "--deployment-runner-endpoint", "--deployment-credential-ref",
   ]);
@@ -183,6 +186,25 @@ function parseWorkflowCredentialReferences(value) {
     }
   }
   return references.sort();
+}
+
+function parseWorkflowIntegrationAccounts(value) {
+  if (value == null) return null;
+  const accounts = [...new Set(String(value).split(",").map((item) => item.trim().toLowerCase()).filter(Boolean))];
+  if (accounts.length > 32 || accounts.some((id) => !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(id))) {
+    throw new Error("workflow integration accounts must contain at most 32 UUIDs");
+  }
+  return accounts.sort();
+}
+
+function parseWorkflowPrivacyZones(value) {
+  if (value == null) return null;
+  const zones = [...new Set(String(value).split(",").map((item) => item.trim().toLowerCase()).filter(Boolean))];
+  if (zones.length < 1 || zones.length > 2
+      || zones.some((zone) => !["internal", "confidential"].includes(zone))) {
+    throw new Error("workflow privacy zones must be internal and/or confidential");
+  }
+  return zones.sort();
 }
 
 function parseDeploymentRunnerEndpoint(value) {
@@ -394,6 +416,10 @@ function buildConfig(options) {
     || process.env.VALKYR_WORKFLOW_RUNTIME_ARTIFACT_SHA256;
   if (workflowRuntimeRequested) {
     const tier = options.workflowEngine ? "engine" : "runner";
+    const integrationAccounts = parseWorkflowIntegrationAccounts(
+      options.workflowIntegrationAccounts ?? process.env.VALKYR_WORKFLOW_INTEGRATION_ACCOUNTS);
+    const privacyZones = parseWorkflowPrivacyZones(
+      options.workflowPrivacyZones ?? process.env.VALKYR_WORKFLOW_PRIVACY_ZONES);
     const credentialReferences = parseWorkflowCredentialReferences(
       options.workflowCredentialRefs ?? process.env.VALKYR_WORKFLOW_CREDENTIAL_REFS,
     );
@@ -435,6 +461,7 @@ function buildConfig(options) {
         ? { workspaceRoots: [execution.workingDirectory] }
         : {}),
       ...(credentialReferences.length > 0 ? { credentialReferences } : {}),
+      ...(integrationAccounts != null ? { integrationAccounts } : {}),
       supportedTools: [tier === "engine"
         ? "workflow.engine.execute-workflow"
         : "workflow.runner.execute-module"],
@@ -443,7 +470,7 @@ function buildConfig(options) {
         ? ["sandbox", "staging", "production"]
         : ["sandbox", "staging"],
       allowedDataClassifications: ["internal"],
-      privacyZones: ["internal"],
+      privacyZones: privacyZones ?? ["internal"],
       networkZones: ["loopback"],
       maxConcurrency: capacity,
       estimatedCost: 0,
@@ -493,7 +520,22 @@ function buildConfig(options) {
       agents: [agent],
     },
     mergeAgents: !options.replaceAgent,
+    workflowPlacementExplicit: {
+      integrationAccounts: options.workflowIntegrationAccounts != null
+        || process.env.VALKYR_WORKFLOW_INTEGRATION_ACCOUNTS != null,
+      privacyZones: options.workflowPrivacyZones != null
+        || process.env.VALKYR_WORKFLOW_PRIVACY_ZONES != null,
+    },
   };
+}
+
+function sameLocalModelPlacement(previous, next) {
+  const before = previous?.nodeContract?.localInferenceProvider;
+  const after = next?.nodeContract?.localInferenceProvider;
+  return previous?.runtime === "local-model" && next?.runtime === "local-model"
+    && previous?.workflowRuntime?.tier === "engine" && next?.workflowRuntime?.tier === "engine"
+    && before?.kind === after?.kind && before?.model === after?.model
+    && before?.endpoint === after?.endpoint;
 }
 
 function writeConfig(target) {
@@ -505,7 +547,23 @@ function writeConfig(target) {
     if (existing.machineId !== config.machineId) throw new Error("Existing SWARM config belongs to another machine");
     requireProductionApiBase(normalizeApiBase(existing.serverUrl));
     const agents = new Map((existing.agents ?? []).map((agent) => [agent.agentId, agent]));
-    config.agents.forEach((agent) => agents.set(agent.agentId, agent));
+    config.agents.forEach((agent) => {
+      const previous = agents.get(agent.agentId);
+      if (sameLocalModelPlacement(previous, agent)) {
+        const oldRuntime = previous.workflowRuntime;
+        if (!target.workflowPlacementExplicit?.integrationAccounts
+            && oldRuntime.integrationAccounts != null) {
+          agent.workflowRuntime.integrationAccounts =
+            parseWorkflowIntegrationAccounts(oldRuntime.integrationAccounts.join(","));
+        }
+        if (!target.workflowPlacementExplicit?.privacyZones
+            && oldRuntime.privacyZones != null) {
+          agent.workflowRuntime.privacyZones =
+            parseWorkflowPrivacyZones(oldRuntime.privacyZones.join(","));
+        }
+      }
+      agents.set(agent.agentId, agent);
+    });
     config = {
       ...existing,
       ...config,

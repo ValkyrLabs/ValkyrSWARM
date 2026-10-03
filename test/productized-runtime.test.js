@@ -140,6 +140,63 @@ test("activation merges multiple product nodes into one supervised machine confi
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("model-only reactivation keeps exact authorized placement and clears it when the model changes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-model-placement-"));
+  const config = path.join(root, "agent.json");
+  const receiptLog = path.join(root, "receipt.jsonl");
+  const account = "11111111-2222-4333-8444-555555555555";
+  const options = {
+    runtime: "local-model",
+    agentId: "lm-studio-qwen-shared-host",
+    machineId: "shared-host",
+    workflowEngine: true,
+    localModelProvider: "lm-studio",
+    localModelId: "qwen/qwen3.8-27b",
+    config,
+    receiptLog,
+  };
+  try {
+    writeConfig(buildConfig({
+      ...options,
+      workflowIntegrationAccounts: account,
+      workflowPrivacyZones: "internal,confidential",
+    }));
+    writeConfig(buildConfig(options));
+    let saved = JSON.parse(fs.readFileSync(config, "utf8")).agents[0].workflowRuntime;
+    assert.deepEqual(saved.integrationAccounts, [account]);
+    assert.deepEqual(saved.privacyZones, ["confidential", "internal"]);
+
+    writeConfig(buildConfig({ ...options, workflowPrivacyZones: "internal",
+      workflowIntegrationAccounts: "" }));
+    saved = JSON.parse(fs.readFileSync(config, "utf8")).agents[0].workflowRuntime;
+    assert.deepEqual(saved.integrationAccounts, []);
+    assert.deepEqual(saved.privacyZones, ["internal"]);
+
+    writeConfig(buildConfig({
+      ...options,
+      workflowIntegrationAccounts: account,
+      workflowPrivacyZones: "internal,confidential",
+    }));
+    writeConfig(buildConfig({ ...options, localModelId: "another-model" }));
+    saved = JSON.parse(fs.readFileSync(config, "utf8")).agents[0].workflowRuntime;
+    assert.equal(saved.integrationAccounts, undefined);
+    assert.deepEqual(saved.privacyZones, ["internal"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow placement options reject malformed account IDs and privacy zones", () => {
+  const options = {
+    runtime: "local-model", machineId: "local-ai", workflowEngine: true,
+    localModelProvider: "lm-studio", localModelId: "qwen/qwen3.8-27b",
+  };
+  assert.throws(() => buildConfig({ ...options, workflowIntegrationAccounts: "not-an-id" }),
+    /integration accounts/);
+  assert.throws(() => buildConfig({ ...options, workflowPrivacyZones: "public" }),
+    /privacy zones/);
+});
+
 test("Workflow runtime ports are unique across agents in a merged machine config", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "valkyr-swarm-ports-"));
   const config = path.join(root, "agent.json");
