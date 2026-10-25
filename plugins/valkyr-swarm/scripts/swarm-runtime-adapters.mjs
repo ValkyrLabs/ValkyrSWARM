@@ -40,8 +40,15 @@ function supervisedRuntimeEnvironment(env = process.env) {
   const pathEntries = String(env.PATH ?? "")
     .split(path.delimiter)
     .filter(Boolean);
+  // The bridge holds tenant credentials. Runtime CLI workers receive only
+  // process essentials and their own CLI authentication home, never a bridge
+  // bearer token or unrelated provider/API credentials from the host shell.
+  const allowed = ["HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME"];
+  const runtimeEnv = Object.fromEntries(allowed
+    .filter((key) => typeof env[key] === "string" && env[key].length > 0)
+    .map((key) => [key, env[key]]));
   return {
-    ...env,
+    ...runtimeEnv,
     PATH: [...new Set([nodeDirectory, ...pathEntries])].join(path.delimiter),
   };
 }
@@ -103,6 +110,11 @@ function buildRuntimePrompt(wire, agent) {
   const command = wire?.command ?? {};
   const commandData = command?.payload?.data ?? command?.data ?? command?.payload ?? command;
   const scope = command?.scope ?? command?.payload?.metadata?.scope ?? command?.metadata?.scope;
+  const retrievalPolicy = {
+    retrievalReceiptRef: command?.retrievalReceiptRef ?? null,
+    answerPolicy: command?.answerPolicy ?? null,
+    recommendedAction: command?.recommendedAction ?? null,
+  };
   const approvalRef = String(command?.approvalRef ?? "").trim();
   const approvedProtectedAction = ["outbound.send", "production.deploy", "merge", "service.lifecycle.restart"].includes(wire?.action)
     && /^gm_approval_[0-9a-f]{64}$/.test(approvalRef)
@@ -122,10 +134,14 @@ function buildRuntimePrompt(wire, agent) {
     `Authorized target instance: ${binding.targetInstanceId ?? "null"}`,
     `Canonical scope digest: ${binding.scopeDigest}`,
     scope ? `Authorized scope: ${boundedText(scope, 2_000)}` : null,
+    Object.values(retrievalPolicy).some(Boolean)
+      ? `Product-bound supplemental GrayMatter retrieval policy (applies to claims from that retrieval, not independently authorized Task sourceFacts): ${boundedText(retrievalPolicy, 1_000)}`
+      : null,
     "",
     protectedActionInstruction,
     "Obey only the bounded Task payload. Do not expand a direct or read-only task into unrelated infrastructure diagnosis, plugin inspection, agent coordination, remediation, or project changes.",
-    "Preserve unrelated work. Use GrayMatter for durable shared context and return concrete verification evidence and changed artifacts.",
+    "Preserve unrelated work and return concrete verification evidence and changed artifacts.",
+    "Use only the bounded Task payload and GrayMatter context hydrated by this authenticated SWARM bridge. Do not invoke ambient or host-account GrayMatter, MCP apps, plugins, or memory tools. The SWARM bridge persists the command receipt. If this exact command authorizes a GrayMatter operation, use only its authenticated Valkyr API binding.",
     `Your final output MUST end with one single-line JSON object using schemaVersion ${RUNTIME_OUTCOME_SCHEMA}. It MUST include status (SUCCEEDED, FAILED, BLOCKED, WAITING_APPROVAL, or OUTCOME_UNCERTAIN), commandId ${binding.commandId}, actionDigest ${binding.actionDigest}, targetInstanceId ${JSON.stringify(binding.targetInstanceId)}, scopeDigest ${binding.scopeDigest}, a concise summary, and evidenceRefs as an array of durable artifact or verification references. SUCCEEDED requires at least one evidenceRef, bounded evidence item, or valid outcomeHash. Do not report SUCCEEDED unless the requested outcome and its verification are complete.`,
     "",
     "Task payload:",
@@ -161,7 +177,7 @@ function buildRuntimeInvocation(config, wire, prompt) {
   if (config.adapter === "openclaw-agent") return buildOpenClawAgentArgs(config, wire, prompt);
   if (config.adapter === "codex-cli") {
     return {
-      args: ["exec", "--json", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", config.workingDirectory ?? process.cwd(), prompt],
+      args: ["exec", "--ignore-user-config", "--disable", "apps", "--disable", "plugins", "--disable", "remote_plugin", "--disable", "skill_search", "--json", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", config.workingDirectory ?? process.cwd(), prompt],
       sessionKey: `codex-${safeSessionSegment(wire.commandId)}`,
     };
   }

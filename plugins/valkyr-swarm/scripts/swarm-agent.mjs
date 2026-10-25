@@ -1724,9 +1724,9 @@ class SwarmAgent {
         });
         return this.runtimeExecutor({
           agent: this.agent,
-          wire: authorizedGrayMatterContext
-            ? { ...wire, authorizedGrayMatterContext }
-            : wire,
+          // A command cannot self-assert that context was read under this
+          // authenticated node token. Only bridge hydration may set this field.
+          wire: { ...wire, authorizedGrayMatterContext: authorizedGrayMatterContext ?? null },
           onProgress,
         });
       })

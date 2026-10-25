@@ -612,7 +612,11 @@ test("Codex execution streams progress and returns a terminal artifact", async (
     { commandId: "cmd-1" },
     "Inspect without protected actions",
   );
-  assert.deepEqual(invocation.args.slice(0, 3), ["exec", "--json", "--ephemeral"]);
+  assert.deepEqual(invocation.args.slice(0, 2), ["exec", "--ignore-user-config"]);
+  for (const feature of ["apps", "plugins", "remote_plugin", "skill_search"]) {
+    assert.equal(invocation.args.some((arg, index) =>
+      arg === "--disable" && invocation.args[index + 1] === feature), true);
+  }
   const progress = [];
   const result = await executeRuntimeCommand({
     agent,
@@ -663,13 +667,22 @@ test("runtime prompt keeps bounded commands from expanding into unrelated work",
   const prompt = buildRuntimePrompt({
     action: "workflow.debug",
     commandId: "cmd-read-only",
-    command: { data: { instruction: "Read the first heading in README.md" } },
+    command: {
+      data: { instruction: "Read the first heading in README.md" },
+      retrievalReceiptRef: "gm_rr_local-bound",
+      answerPolicy: "REQUIRE_CLARIFICATION",
+      recommendedAction: "ASK_CLARIFYING_QUESTION",
+    },
     trace: { traceId: "trace-read-only" },
   }, { agentId: "codex-host", runtime: "codex" });
 
   assert.match(prompt, /Obey only the bounded Task payload/);
   assert.match(prompt, /Do not expand a direct or read-only task/);
-  assert.match(prompt, /Use GrayMatter for durable shared context/);
+  assert.doesNotMatch(prompt, /Use GrayMatter for durable shared context/);
+  assert.match(prompt, /Do not invoke ambient or host-account GrayMatter/);
+  assert.match(prompt, /gm_rr_local-bound/);
+  assert.match(prompt, /REQUIRE_CLARIFICATION/);
+  assert.match(prompt, /ASK_CLARIFYING_QUESTION/);
 });
 
 test("runtime prompt includes bridge-hydrated GrayMatter context without changing command binding", () => {
@@ -955,7 +968,14 @@ test("CLI terminal receipts retain the final structured agent reply after long p
 });
 
 test("supervised runtime execution always makes the active Node binary discoverable", () => {
-  const env = supervisedRuntimeEnvironment({ PATH: "/usr/bin:/bin" });
+  const env = supervisedRuntimeEnvironment({
+    PATH: "/usr/bin:/bin", HOME: "/private/worker", CODEX_HOME: "/private/worker/codex",
+    VALKYR_AUTH_TOKEN: "bridge-bearer", OPENAI_API_KEY: "unrelated-provider-secret",
+  });
   assert.equal(env.PATH.split(path.delimiter)[0], path.dirname(process.execPath));
   assert.equal(env.PATH.split(path.delimiter).includes("/usr/bin"), true);
+  assert.equal(env.HOME, "/private/worker");
+  assert.equal(env.CODEX_HOME, "/private/worker/codex");
+  assert.equal(Object.hasOwn(env, "VALKYR_AUTH_TOKEN"), false);
+  assert.equal(Object.hasOwn(env, "OPENAI_API_KEY"), false);
 });
