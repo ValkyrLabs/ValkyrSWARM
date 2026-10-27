@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildConfig,
@@ -47,6 +49,28 @@ function fakeSpawn(stdoutText, stderrText = "", exitCode = 0) {
     return child;
   };
 }
+
+test("offline activation checks use an explicit fixture while real activation still requires its CLI", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "swarm-offline-activation-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const script = fileURLToPath(new URL("../scripts/swarm-activate.mjs", import.meta.url));
+  const env = { ...process.env, PATH: directory,
+    VALKYR_API_BASE: "https://api-0.valkyrlabs.com/v1", VALKYR_SWARM_RUNTIME: "codex" };
+  const selfTest = spawnSync(process.execPath, [script, "--self-test"], { env, encoding: "utf8" });
+  assert.equal(selfTest.status, 0, selfTest.stderr);
+  const dryRun = spawnSync(process.execPath, [script, "--runtime", "codex",
+    "--machine-id", "offline-fixture", "--runtime-executable", process.execPath, "--dry-run"],
+    { env, encoding: "utf8" });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.equal(plan.dryRun, true);
+  assert.equal(plan.agent.execution.adapter, "codex-cli");
+  assert.equal(plan.agent.execution.executable, process.execPath);
+  const missing = spawnSync(process.execPath, [script, "--runtime", "claude-code", "--dry-run"],
+    { env, encoding: "utf8" });
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /No executable runtime found for claude-code/);
+});
 
 test("Workflow release discovery timeout is bounded and tolerant of a loaded mothership", () => {
   assert.equal(workflowReleaseDiscoveryTimeoutMs({}), 120_000);

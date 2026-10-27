@@ -11,7 +11,7 @@ node "$ROOT/scripts/swarm-doctor.mjs" --self-test
 node "$ROOT/scripts/swarm-openclaw-bootstrap.mjs" bootstrap --self-test
 node "$ROOT/scripts/swarm-service.mjs" self-test
 
-dry_run="$(VALKYR_SWARM_RUNTIME=codex node "$ROOT/scripts/swarm-activate.mjs" --machine-id 'Test Host' --dry-run)"
+dry_run="$(VALKYR_SWARM_RUNTIME=codex node "$ROOT/scripts/swarm-activate.mjs" --machine-id 'Test Host' --runtime-executable "$(command -v node)" --dry-run)"
 jq -e '
   .dryRun == true
   and .apiBase == "https://api-0.valkyrlabs.com/v1"

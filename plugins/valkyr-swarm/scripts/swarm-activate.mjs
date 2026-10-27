@@ -871,7 +871,7 @@ function installWorkflowRuntime(target, requestedAgentId) {
 function selfTest() {
   const prior = process.env.VALKYR_SWARM_RUNTIME;
   process.env.VALKYR_SWARM_RUNTIME = "codex";
-  const target = buildConfig({ machineId: "Example Host" });
+  const target = buildConfig({ machineId: "Example Host", runtimeExecutable: process.execPath });
   if (target.config.machineId !== "example-host") throw new Error("Machine normalization failed");
   if (target.config.agents[0].agentId !== "codex-example-host") throw new Error("Agent derivation failed");
   if (target.apiBase !== DEFAULT_API_BASE) throw new Error("Default API base failed");
