@@ -272,6 +272,83 @@ test("durable workflow approval denial reaches the exact loopback checkpoint", a
   assert.deepEqual(JSON.parse(calls[0].options.body), payload);
 });
 
+for (const state of ["RUNNING", "WAITING_APPROVAL", "SUCCESS"]) {
+  test(`refs-only ${state} checkpoint preserves the native result lifecycle`, async () => {
+    const engineAgent = { ...agent, workflowRuntime: { ...agent.workflowRuntime, tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health" } };
+    const callbacks = { heartbeat: "/v1/vaiworkflow/engine/heartbeat", progress: "/v1/vaiworkflow/engine/progress",
+      complete: "/v1/vaiworkflow/engine/complete" };
+    const event = { id: 1, executionId: "execution-checkpoint", workflowRunnerId: "runner-checkpoint",
+      workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", definitionSnapshotHash: "d".repeat(64),
+      leaseFence: 17, callbacks, eventType: state === "SUCCESS" ? "SUCCESS" : "CHECKPOINT",
+      payload: { state, checkpointRef: "checkpoint-1" } };
+    const calls = [];
+    const result = { success: true, terminalState: state, checkpointRef: "checkpoint-1",
+      finalState: { email: { subject: "Explicit private checkpoint fixture", body: "Review this actual draft." },
+        modelProvenance: { llmDetailsId: "canonical-model-fixture" } } };
+    const fetchImpl = async (url, options = {}) => {
+      const value = String(url); calls.push({ url: value, options });
+      let body = { accepted: true };
+      if (value.endsWith("/events/ack")) body = { acknowledged: 1 };
+      else if (value.includes("/events?")) body = { acknowledged: 0, events: [event] };
+      else if (value.includes("/result?")) {
+        assert.ok(options.headers["X-Valkyr-Engine-Authorization"]);
+        assert.equal(options.headers.Authorization, undefined);
+        const query = new URL(value).searchParams;
+        assert.equal(query.get("leaseFence"), "17");
+        assert.equal(query.get("checkpointRef"), "checkpoint-1");
+        assert.equal(query.get("terminalState"), state);
+        body = result;
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const replay = await forwardWorkflowEngineEventsOnce({ agent: engineAgent,
+      apiBase: "https://api-0.valkyrlabs.com/v1", tokenProvider: async () => "session-token", fetchImpl });
+    assert.equal(replay.next, 1);
+    const completed = calls.filter(call => call.url.endsWith("/engine/complete"));
+    if (state === "RUNNING") {
+      assert.equal(completed.length, 0);
+      assert.equal(calls.filter(call => call.url.includes("/result?")).length, 0);
+      assert.equal(calls.filter(call => call.url.endsWith("/engine/progress")).length, 1);
+    } else {
+      assert.equal(calls.filter(call => call.url.includes("/result?")).length, 1);
+      assert.equal(completed.length, 1);
+      assert.deepEqual(JSON.parse(completed[0].options.body).finalState, result.finalState);
+    }
+  });
+}
+
+for (const failure of ["missing-result", "private-unavailable", "replaced-checkpoint"]) {
+  test(`private checkpoint ${failure} cannot manufacture a completion`, async () => {
+    const engineAgent = { ...agent, workflowRuntime: { ...agent.workflowRuntime, tier: "engine",
+      endpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/execute",
+      healthEndpoint: "http://127.0.0.1:8767/v1/swarm/workflow-engine/health" } };
+    const calls = [];
+    const fetchImpl = async (url, options = {}) => {
+      const value = String(url); calls.push(value);
+      let status = 200, body = { accepted: true };
+      if (value.includes("/events?")) body = { acknowledged: 0, events: [{ id: 1,
+        executionId: "execution-private", workflowRunnerId: "runner-private",
+        workflowVersionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", definitionSnapshotHash: "d".repeat(64),
+        leaseFence: 17, eventType: "CHECKPOINT", payload: { state: "WAITING_APPROVAL", checkpointRef: "checkpoint-1" },
+        callbacks: { complete: "/v1/vaiworkflow/engine/complete" } }] };
+      else if (value.includes("/result?")) {
+        if (failure === "missing-result") body = {};
+        else if (failure === "private-unavailable") { status = 503; body = { code: "STORAGE_UNAVAILABLE" }; }
+        else { status = 409; body = { code: "WORKFLOW_ENGINE_CHECKPOINT_REPLACED", retryable: false }; }
+      } else if (value.endsWith("/events/ack")) body = { acknowledged: 1 };
+      return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    };
+    const forward = () => forwardWorkflowEngineEventsOnce({ agent: engineAgent,
+      apiBase: "https://api-0.valkyrlabs.com/v1", tokenProvider: async () => "session-token", fetchImpl });
+    if (failure === "replaced-checkpoint") assert.equal((await forward()).next, 1);
+    else await assert.rejects(forward, /checkpoint result|HTTP 503/);
+    assert.equal(calls.filter(value => value.endsWith("/engine/complete")).length, 0);
+    assert.equal(calls.filter(value => value.endsWith("/events/ack")).length, failure === "replaced-checkpoint" ? 1 : 0);
+  });
+}
+
 test("durable engine replays local progress and terminal callbacks after the command request returns", async () => {
   const engineAgent = {
     ...agent,
@@ -327,6 +404,11 @@ test("durable engine replays local progress and terminal callbacks after the com
           },
         ],
       }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (value.includes("/executions/execution-9/result?")) {
+      return new Response(JSON.stringify({ success: true, terminalState: "SUCCESS",
+        finalState: { answer: 42 }, checkpointRef: null }), { status: 200,
+        headers: { "content-type": "application/json" } });
     }
     if (value.includes("api-0.valkyrlabs.com")) {
       return new Response(JSON.stringify({ accepted: true }), {

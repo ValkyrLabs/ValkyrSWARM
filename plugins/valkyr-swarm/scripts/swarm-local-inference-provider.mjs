@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const PROVIDER_PROTOCOL = "valkyr-local-inference-provider/v1";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -51,6 +53,15 @@ function modelsEndpoint(provider) {
   const pathname = endpoint.pathname.endsWith("/") ? endpoint.pathname : `${endpoint.pathname}/`;
   endpoint.pathname = `${pathname}models`.replace(/\/+/g, "/");
   return endpoint.toString();
+}
+
+// Placement evidence only. Credentials and provider URLs stay in the node configuration.
+function providerConnectionHash(provider) {
+  const endpoint = new URL(normalizeProviderEndpoint(provider.kind, provider.endpoint));
+  const path = provider.kind === "lm-studio" ? "/v1/chat/completions" : "/api/chat";
+  const canonicalEndpoint = `http://${endpoint.hostname}:${endpoint.port || "80"}${path}`;
+  return createHash("sha256").update(JSON.stringify({ endpoint: canonicalEndpoint,
+    providerKind: provider.kind })).digest("hex");
 }
 
 function parseModels(provider, payload) {
@@ -176,5 +187,6 @@ export {
   normalizeProviderEndpoint,
   probeLocalInferenceProvider,
   providerDescriptor,
+  providerConnectionHash,
   requireHealthyLocalInferenceProvider,
 };

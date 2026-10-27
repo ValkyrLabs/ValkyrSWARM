@@ -8,6 +8,13 @@ const DEFAULT_HANDOFF_SOURCE = "valkyr-swarm:handoff";
 const MAX_MEMORY_TEXT_CHARS = 16_000;
 const GRAYMATTER_REQUEST_TIMEOUT_MS = 60_000;
 const DEFINITIVE_RECEIPT_REJECTIONS = new Set([401, 402, 403]);
+const DEFAULT_RECEIPT_REPLAY_BATCH_SIZE = 25;
+const MAX_RECEIPT_RETRY_DELAY_MS = 24 * 60 * 60 * 1000;
+const RECEIPT_RETRY_BASE_DELAY_MS = new Map([
+  [401, 5 * 60 * 1000],
+  [402, 30 * 60 * 1000],
+  [403, 6 * 60 * 60 * 1000],
+]);
 const DEFAULT_REPLAY_DIR = path.join(os.homedir(), ".config", "valkyr-swarm", "graymatter-replay");
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
 const SENSITIVE_KEY = /(authorization|bearer|cookie|credential|password|private.?key|secret|token|api.?key)/i;
@@ -70,6 +77,30 @@ function redactStructured(value, key = "", depth = 0) {
 
 function normalizeApiBase(value) {
   return String(value ?? "https://api-0.valkyrlabs.com/v1").replace(/\/+$/, "");
+}
+
+function receiptRetryDelayMs(httpStatus, attempts) {
+  const base = RECEIPT_RETRY_BASE_DELAY_MS.get(Number(httpStatus)) ?? 30 * 60 * 1000;
+  return Math.min(MAX_RECEIPT_RETRY_DELAY_MS, base * (2 ** Math.min(Math.max(0, attempts - 1), 8)));
+}
+
+function scheduleDefinitiveReceiptRetry(record, error, nowMs) {
+  const attempts = Math.max(0, Number(record.retry?.attempts) || 0) + 1;
+  const httpStatus = Number(error?.httpStatus);
+  const retryAt = nowMs + receiptRetryDelayMs(httpStatus, attempts);
+  record.submissionStarted = false;
+  record.retry = {
+    attempts,
+    httpStatus,
+    lastRejectedAt: new Date(nowMs).toISOString(),
+    nextAttemptAt: new Date(retryAt).toISOString(),
+  };
+}
+
+function receiptRetryDue(record, nowMs) {
+  if (!record.retry?.nextAttemptAt) return true;
+  const retryAt = Date.parse(record.retry.nextAttemptAt);
+  return !Number.isFinite(retryAt) || retryAt <= nowMs;
 }
 
 async function requestGrayMatter({ apiBase, token, pathname, body, fetchImpl = fetch }) {
@@ -447,6 +478,7 @@ async function persistCommandReceipt({
       body,
       replayDir,
       submissionUncertain: !DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus),
+      failure: error,
     });
     return {
       id: null,
@@ -514,6 +546,7 @@ async function persistWorkflowHandoff({
       body,
       replayDir,
       submissionUncertain: !DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus),
+      failure: error,
     });
     return {
       id: null,
@@ -524,7 +557,15 @@ async function persistWorkflowHandoff({
   }
 }
 
-function queueReceiptReplay({ agentId, apiBase, body, replayDir = DEFAULT_REPLAY_DIR, submissionUncertain = false }) {
+function queueReceiptReplay({
+  agentId,
+  apiBase,
+  body,
+  replayDir = DEFAULT_REPLAY_DIR,
+  submissionUncertain = false,
+  failure = null,
+  now = Date.now,
+}) {
   fs.mkdirSync(replayDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(replayDir, 0o700);
   const filename = `${safeTag(agentId)}-${safeTag(body.sourceMessageId)}.json`;
@@ -538,6 +579,9 @@ function queueReceiptReplay({ agentId, apiBase, body, replayDir = DEFAULT_REPLAY
     queuedAt: new Date().toISOString(),
     ...(submissionUncertain ? { submissionStarted: true } : {}),
   };
+  if (!submissionUncertain && DEFINITIVE_RECEIPT_REJECTIONS.has(failure?.httpStatus)) {
+    scheduleDefinitiveReceiptRetry(record, failure, Number(now()));
+  }
   saveReceiptReplayState(queuePath, record);
   return queuePath;
 }
@@ -549,10 +593,15 @@ async function replayQueuedReceipts({
   fetchImpl = fetch,
   replayDir = DEFAULT_REPLAY_DIR,
   onPersisted = async () => {},
+  now = Date.now,
+  maxAttempts = DEFAULT_RECEIPT_REPLAY_BATCH_SIZE,
 }) {
   if (!fs.existsSync(replayDir)) return [];
   const token = await tokenProvider();
   if (!token) return [];
+  const nowMs = Number(now());
+  const attemptLimit = Math.max(1, Number(maxAttempts) || DEFAULT_RECEIPT_REPLAY_BATCH_SIZE);
+  let attempts = 0;
   const results = [];
   for (const name of fs.readdirSync(replayDir).filter((item) => item.endsWith(".json")).sort()) {
     const queuePath = path.join(replayDir, name);
@@ -567,11 +616,17 @@ async function replayQueuedReceipts({
       // Retain the returned identity before downstream completion bookkeeping.
       // Replaying a receipt that is already persisted must not submit it again.
       if (!record.persistedMemoryEntryId && (record.submissionStarted || record.persistenceUncertain)) {
-        results.push({ queuePath, id: null, status: record.persistenceUncertain ? "persisted_without_valid_id" : "outcome_uncertain" });
+        // The durable queue record is the evidence for an uncertain submission.
+        // Re-emitting it on every heartbeat creates an unbounded event storm
+        // without changing state, and automatic resubmission could duplicate an
+        // effect whose server outcome is unknown.
         continue;
       }
+      if (!record.persistedMemoryEntryId && !receiptRetryDue(record, nowMs)) continue;
       let memory = { id: record.persistedMemoryEntryId };
       if (!record.persistedMemoryEntryId) {
+        if (attempts >= attemptLimit) continue;
+        attempts += 1;
         record.submissionStarted = true;
         saveReceiptReplayState(queuePath, record);
         memory = await requestGrayMatter({ apiBase, token, pathname: "/MemoryEntry/write", body: record.body, fetchImpl });
@@ -597,13 +652,14 @@ async function replayQueuedReceipts({
       // These responses reject the request before creating a MemoryEntry. A
       // timeout, transport loss, server error or local disk failure is ambiguous.
       if (!record.persistedMemoryEntryId && DEFINITIVE_RECEIPT_REJECTIONS.has(error?.httpStatus)) {
-        record.submissionStarted = false;
+        scheduleDefinitiveReceiptRetry(record, error, nowMs);
         try { saveReceiptReplayState(queuePath, record); } catch { /* Retain the conservative started marker. */ }
       }
       results.push({
         queuePath,
         id: record.persistedMemoryEntryId ?? null,
         status: record.persistedMemoryEntryId ? "persisted_pending_delivery" : record.submissionStarted ? "outcome_uncertain" : "queued",
+        retryAt: record.retry?.nextAttemptAt ?? null,
         error: error instanceof Error ? error.message : String(error),
       });
     }

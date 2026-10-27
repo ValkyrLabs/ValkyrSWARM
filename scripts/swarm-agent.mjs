@@ -652,6 +652,10 @@ class SwarmAgent {
     this.heartbeatTimer = null;
     this.reconnectTimer = null;
     this.reconnectAttempt = 0;
+    this.registrationRetryTimer = null;
+    this.registrationAckTimer = null;
+    this.registrationMessageId = null;
+    this.registrationAttempt = 0;
     this.stopped = false;
     this.sequence = 0;
     this.inFlightCommands = new Map();
@@ -843,6 +847,10 @@ class SwarmAgent {
   }
 
   sendRegistration() {
+    if (this.stopped || this.websocket?.readyState !== WebSocket.OPEN
+        || (this.registrationMessageId && this.pendingControlMessages.has(this.registrationMessageId))) return;
+    clearTimeout(this.registrationRetryTimer);
+    this.registrationRetryTimer = null;
     const runner = constrainNodeAdvertisement(
       this.agent,
       workflowRunnerMetadata(this.agent, this.workflowRuntimeState),
@@ -853,7 +861,7 @@ class SwarmAgent {
     );
     const workflowRuntimeReady = (runner.supportedTools ?? []).some((tool) =>
       tool === "workflow.runner.execute-module" || tool === "workflow.engine.execute-workflow");
-    this.sendControlMessage("register", {
+    const messageId = this.sendControlMessage("register", {
       announcement: {
         agentId: this.agent.agentId,
         runtime: this.agent.runtime,
@@ -870,6 +878,27 @@ class SwarmAgent {
         version: this.agent.version ?? `valkyr-swarm/${PACKAGE_VERSION}`,
       },
     });
+    this.registrationMessageId = messageId;
+    this.registrationAckTimer = setTimeout(() => {
+      if (this.registrationMessageId !== messageId) return;
+      this.pendingControlMessages.delete(messageId);
+      this.registrationMessageId = null;
+      this.scheduleRegistrationRetry("SWARM_CONTROL_ACK_TIMEOUT");
+    }, 15_000);
+    return messageId;
+  }
+
+  scheduleRegistrationRetry(code) {
+    if (this.stopped || this.websocket?.readyState !== WebSocket.OPEN || this.registrationRetryTimer) return;
+    const delay = Math.min(30_000, 1_000 * (2 ** Math.min(this.registrationAttempt, 5)));
+    this.registrationAttempt += 1;
+    this.evidence.record("registration_retry_scheduled", {
+      agentId: this.agent.agentId, code, retryAfterMs: delay,
+    });
+    this.registrationRetryTimer = setTimeout(() => {
+      this.registrationRetryTimer = null;
+      this.sendRegistration();
+    }, delay);
   }
 
   startHeartbeat() {
@@ -1109,6 +1138,18 @@ class SwarmAgent {
     clearTimeout(pending.timer);
     this.pendingControlMessages.delete(reply.ackId);
     const accepted = reply.topic === "ack" && reply.status !== "rejected";
+    if (pending.action === "register") {
+      clearTimeout(this.registrationAckTimer);
+      this.registrationAckTimer = null;
+      this.registrationMessageId = null;
+      if (accepted) {
+        this.registrationAttempt = 0;
+        clearTimeout(this.registrationRetryTimer);
+        this.registrationRetryTimer = null;
+      } else if (["ERR_SWARM_DATABASE_PRESSURE", "ERR_SWARM_SERVICE_UNAVAILABLE"].includes(reply.code)) {
+        this.scheduleRegistrationRetry(reply.code);
+      }
+    }
     this.evidence.record(`${pending.action}_${accepted ? "ack" : "nack"}`, {
       agentId: this.agent.agentId,
       messageId: reply.ackId,
@@ -1834,6 +1875,9 @@ class SwarmAgent {
         });
       })
       .catch(async (error) => {
+        const retryableWorkflowTransport = workflowRuntime
+          && wire.action === "workflow.engine.execute-workflow"
+          && error?.code === "WORKFLOW_ENGINE_TRANSPORT_INCOMPLETE";
         const failed = ordinaryRuntime
           ? adapterErrorResponse(wire, adapter, error)
           : {
@@ -1844,6 +1888,7 @@ class SwarmAgent {
                 adapter,
                 executed: false,
                 receiptOnly: false,
+                ...(retryableWorkflowTransport ? { retryable: true, transportIncomplete: true } : {}),
               },
             };
         if (ordinaryRuntime) {
@@ -1874,7 +1919,10 @@ class SwarmAgent {
             });
           }
         }
-        this.rememberCompleted(wire.commandId, failed);
+        // The immutable native journal owns execution deduplication. An interrupted
+        // transport is not a native terminal outcome and must permit the same command
+        // to materialize/resume that journal after reconnecting.
+        if (!retryableWorkflowTransport) this.rememberCompleted(wire.commandId, failed);
         this.sendCommandResponse(wire, failed);
         this.evidence.record("command_failed", {
           action: wire.action,
@@ -1897,6 +1945,11 @@ class SwarmAgent {
 
   onClose(event) {
     clearInterval(this.heartbeatTimer);
+    clearTimeout(this.registrationRetryTimer);
+    clearTimeout(this.registrationAckTimer);
+    this.registrationRetryTimer = null;
+    this.registrationAckTimer = null;
+    this.registrationMessageId = null;
     for (const [id, pending] of this.pendingControlMessages) {
       clearTimeout(pending.timer);
       pending.reject?.(new Error(`SWARM ${pending.action} disconnected before acknowledgement`));
@@ -1928,6 +1981,8 @@ class SwarmAgent {
     this.stopped = true;
     clearInterval(this.heartbeatTimer);
     clearTimeout(this.reconnectTimer);
+    clearTimeout(this.registrationRetryTimer);
+    clearTimeout(this.registrationAckTimer);
     if (this.websocket?.readyState === WebSocket.OPEN) {
       this.websocket.send(stompFrame("DISCONNECT", { receipt: `stop-${this.agent.agentId}` }));
       this.websocket.close(1000, "swarm agent complete");

@@ -166,7 +166,7 @@ test("a successful replay response without a receipt id is held without automati
   const input = { agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
     tokenProvider: async () => "fixture-token", fetchImpl: async () => { posts++; return new Response("{}"); } };
   assert.equal((await replayQueuedReceipts(input))[0].status, "persisted_without_valid_id");
-  assert.equal((await replayQueuedReceipts(input))[0].status, "persisted_without_valid_id");
+  assert.deepEqual(await replayQueuedReceipts(input), []);
   assert.equal(posts, 1);
   assert.equal(fs.readdirSync(replayDir).length, 1);
 });
@@ -284,7 +284,7 @@ test("a failed local write after server persistence leaves the replay submission
   const input = { agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
     tokenProvider: async () => "fixture-token", fetchImpl: async () => { posts++; return new Response(JSON.stringify({ id: receiptId })); } };
   await replayQueuedReceipts(input);
-  assert.equal((await replayQueuedReceipts(input))[0].status, "outcome_uncertain");
+  assert.deepEqual(await replayQueuedReceipts(input), []);
   assert.equal(posts, 1);
 });
 
@@ -294,10 +294,55 @@ test("definitive funding rejection can retry through the queue while transport u
     body: { sourceChannel: "test", sourceMessageId: "receipt-test", text: "fixture" } });
   const input = { agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
     tokenProvider: async () => "fixture-token" };
-  assert.equal((await replayQueuedReceipts({ ...input, fetchImpl: async () => new Response("{}", { status: 402 }) }))[0].status, "queued");
+  const funding = await replayQueuedReceipts({ ...input, fetchImpl: async () => new Response("{}", { status: 402 }) });
+  assert.equal(funding[0].status, "queued");
+  const afterFundingRetry = Date.parse(funding[0].retryAt) + 1;
   let posts = 0;
-  const uncertain = { ...input, fetchImpl: async () => { posts++; throw new Error("fixture transport timeout"); } };
+  const uncertain = { ...input, now: () => afterFundingRetry,
+    fetchImpl: async () => { posts++; throw new Error("fixture transport timeout"); } };
   assert.equal((await replayQueuedReceipts(uncertain))[0].status, "outcome_uncertain");
-  assert.equal((await replayQueuedReceipts(uncertain))[0].status, "outcome_uncertain");
+  assert.deepEqual(await replayQueuedReceipts(uncertain), []);
   assert.equal(posts, 1);
+});
+
+test("authorization-denied receipt replay is durably backed off", async (t) => {
+  const fx = fixture(t), replayDir = path.join(fx.root, "receipts");
+  queueReceiptReplay({ agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
+    body: { sourceChannel: "test", sourceMessageId: "receipt-authorization", text: "fixture" } });
+  let posts = 0;
+  const now = Date.parse("2026-09-20T12:00:00.000Z");
+  const input = { agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
+    now: () => now, tokenProvider: async () => "fixture-token",
+    fetchImpl: async () => { posts++; return new Response("{}", { status: 403 }); } };
+  const rejected = await replayQueuedReceipts(input);
+  assert.equal(rejected[0].status, "queued");
+  assert.ok(Date.parse(rejected[0].retryAt) >= now + 6 * 60 * 60 * 1000);
+  assert.deepEqual(await replayQueuedReceipts(input), []);
+  assert.equal(posts, 1);
+  const record = JSON.parse(fs.readFileSync(path.join(replayDir, fs.readdirSync(replayDir)[0]), "utf8"));
+  assert.equal(record.retry.httpStatus, 403);
+  assert.equal(record.retry.attempts, 1);
+  assert.equal(record.submissionStarted, false);
+});
+
+test("large receipt queues skip uncertain records and cap each network replay batch", async (t) => {
+  const fx = fixture(t), replayDir = path.join(fx.root, "receipts");
+  for (let i = 0; i < 60; i++) {
+    queueReceiptReplay({ agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
+      submissionUncertain: true,
+      body: { sourceChannel: "test", sourceMessageId: `uncertain-${String(i).padStart(3, "0")}`, text: "fixture" } });
+  }
+  for (let i = 0; i < 40; i++) {
+    queueReceiptReplay({ agentId: fx.agent.agentId, apiBase: "https://api-0.valkyrlabs.com/v1", replayDir,
+      body: { sourceChannel: "test", sourceMessageId: `retryable-${String(i).padStart(3, "0")}`, text: "fixture" } });
+  }
+  let posts = 0;
+  const result = await replayQueuedReceipts({ agentId: fx.agent.agentId,
+    apiBase: "https://api-0.valkyrlabs.com/v1", replayDir, maxAttempts: 10,
+    now: () => Date.parse("2026-09-20T12:00:00.000Z"), tokenProvider: async () => "fixture-token",
+    fetchImpl: async () => { posts++; return new Response("{}", { status: 403 }); } });
+  assert.equal(posts, 10);
+  assert.equal(result.length, 10);
+  assert.ok(result.every(({ status, retryAt }) => status === "queued" && retryAt));
+  assert.equal(fs.readdirSync(replayDir).length, 100);
 });

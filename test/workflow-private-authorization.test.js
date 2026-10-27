@@ -81,6 +81,22 @@ test("private pending discovery resumes across bridge restarts with one canonica
   assert.equal(f.calls.filter(c => c.path.endsWith("/complete")).length, 0);
 });
 
+test("company-scale authorization crosses the private bridge after restart discovery", async t => {
+  const f = fixture(t);
+  const companyConversation = "c".repeat(160_000);
+  f.pending.request.effectiveInputs = {
+    modelRequestMessages: [{ role: "user", content: companyConversation }],
+  };
+  assert.ok(Buffer.byteLength(JSON.stringify(f.pending.request), "utf8") > 147456);
+
+  const result = await exchangeWorkflowEngineAuthorizationsOnce(f.options());
+
+  assert.equal(result.handled, 1);
+  assert.equal(result.outcomes[0].status, "WAITING_APPROVAL");
+  assert.equal(f.calls.filter(c => c.path.endsWith("/capability-grant")).length, 1);
+  assert.equal(f.calls.filter(c => c.body?.result?.status === "WAITING_APPROVAL").length, 1);
+});
+
 test("structured reconciliation is delivered privately instead of being discarded as a stale callback", async t => {
   const f = fixture(t); f.status("RECONCILIATION_REQUIRED");
   const result = await exchangeWorkflowEngineAuthorizationsOnce(f.options());

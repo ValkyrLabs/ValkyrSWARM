@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { commandDisposition, validateConfig } from "../scripts/swarm-agent.mjs";
+import { workflowRunnerMetadata } from "../scripts/swarm-workflow-runtime.mjs";
 import {
   MODEL_ONLY_LIFECYCLE_ACTIONS,
   MODEL_ONLY_WORKFLOW_ACTIONS,
@@ -131,6 +132,28 @@ test("model-only advertisement strips native, pack, and implementation capabilit
   assert.equal(projected.supportedModels, undefined);
   assert.equal(projected.localInferenceProvider.endpoint, undefined);
   assert.equal(projected.localInferenceProvider.kind, "lm-studio");
+});
+
+test("model-only placement retains healthy engine protocol, installed ABI and pack facts without granting native actions", () => {
+  const agent = modelOnlyAgent();
+  const state = {
+    healthy: true, status: "healthy", protocol: "valkyr-workflow-engine/v1",
+    protocols: ["valkyr-workflow-engine/v1"],
+    capabilities: ["workflow.graph:v1", "workflow.persistence:h2-aes", "code.execute"],
+    supportedTools: [...MODEL_ONLY_WORKFLOW_ACTIONS],
+    moduleAbiHashes: { "com.valkyrlabs.workflow.modules.localinference.LocalInferenceModule": "a".repeat(64) },
+    capabilityPacks: [{ id: "local-inference", version: "1.1.0" }],
+  };
+  const advertisement = constrainNodeAdvertisement(agent, workflowRunnerMetadata(agent, state));
+  for (const capability of ["workflow.graph:v1", "workflow.persistence:h2-aes", "java:17",
+    `execmodule-abi:${"a".repeat(64)}`, "workflow-pack:local-inference:1.1.0"]) {
+    assert.ok(advertisement.capabilities.includes(capability), `Missing actual engine placement evidence: ${capability}`);
+  }
+  assert.ok(!advertisement.capabilities.includes("code.execute"));
+  for (const action of ["code.execute", "shell.execute", `execmodule-abi:${"a".repeat(64)}`]) {
+    assert.equal(commandDisposition({ targetInstanceId: agent.agentId, action, command: {} }, agent, state).disposition, "reject");
+  }
+  assert.deepEqual(constrainNodeAdvertisement(agent, workflowRunnerMetadata(agent, { ...state, healthy: false })).capabilities, []);
 });
 
 test("model-only command routing rejects arbitrary native capabilities before dispatch", () => {

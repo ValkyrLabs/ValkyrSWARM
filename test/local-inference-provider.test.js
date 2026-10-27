@@ -5,6 +5,7 @@ import { buildConfig } from "../scripts/swarm-activate.mjs";
 import {
   probeLocalInferenceProvider,
   providerDescriptor,
+  providerConnectionHash,
 } from "../scripts/swarm-local-inference-provider.mjs";
 
 function response(payload, status = 200) {
@@ -13,6 +14,15 @@ function response(payload, status = 200) {
     headers: { "content-type": "application/json" },
   });
 }
+
+test("provider placement binds the exact loopback connection without advertising its URL", () => {
+  const first = providerDescriptor("lm-studio", "gemma", "http://127.0.0.1:1234/v1");
+  const same = providerDescriptor("lm-studio", "gemma", "http://127.0.0.1:1234/v1/");
+  const moved = providerDescriptor("lm-studio", "gemma", "http://127.0.0.1:1235/v1");
+  assert.equal(providerConnectionHash(first), providerConnectionHash(same));
+  assert.notEqual(providerConnectionHash(first), providerConnectionHash(moved));
+  assert.match(providerConnectionHash(first), /^[a-f0-9]{64}$/);
+});
 
 test("model-only activation produces the exact signed-workflow-only node contract", () => {
   const agent = buildConfig({

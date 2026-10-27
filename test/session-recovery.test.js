@@ -131,3 +131,70 @@ test("the affected agent supplies its rejected session and ignores replaced sock
   assert.match(second.sent[0], /Bearer new-session/);
   assert.doesNotMatch(JSON.stringify(evidence), /old-session|new-session/);
 });
+
+test("temporary registration rejection retries on the current connection and stops after acknowledgment", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const announcements = [];
+  const runtime = new SwarmAgent({
+    agent: { agentId: "registration-recovery", runtime: "codex", capabilities: ["graymatter.context"] },
+    apiBase: "https://api-0.valkyrlabs.com/v1", machineId: "registration-host",
+    url: "wss://api-0.valkyrlabs.com/ws", heartbeatSeconds: 30,
+    tokenProvider: async () => "identified-session-fixture", evidence: { record() {} },
+  });
+  runtime.websocket = { readyState: WebSocket.OPEN, send() {}, close() {} };
+  runtime.sendAppTopic = (_topic, message) => announcements.push(message);
+  t.after(() => runtime.stop());
+  runtime.sendRegistration();
+  const first = announcements.at(-1);
+  runtime.onServerControlReply(JSON.stringify({ payload: { topic: "nack", payload: { ackId: first.id,
+    status: "rejected", code: "ERR_SWARM_DATABASE_PRESSURE", error: "Deferred while database recovers" } } }));
+  assert.equal(announcements.length, 1);
+  t.mock.timers.tick(1000);
+  assert.equal(announcements.length, 2, "The product node re-registers without a test driver");
+  const second = announcements.at(-1);
+  runtime.onServerControlReply(JSON.stringify({ payload: { topic: "ack", payload: { ackId: second.id,
+    status: "registered", data: { instanceId: runtime.agent.agentId } } } }));
+  t.mock.timers.tick(60000);
+  assert.equal(announcements.length, 2, "An accepted registration has no remaining retry");
+});
+
+test("registration authorization denial is not retried", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const announcements = [];
+  const runtime = new SwarmAgent({
+    agent: { agentId: "registration-denied", runtime: "codex", capabilities: ["graymatter.context"] },
+    apiBase: "https://api-0.valkyrlabs.com/v1", machineId: "registration-host",
+    url: "wss://api-0.valkyrlabs.com/ws", heartbeatSeconds: 30,
+    tokenProvider: async () => "identified-session-fixture", evidence: { record() {} },
+  });
+  runtime.websocket = { readyState: WebSocket.OPEN, send() {}, close() {} };
+  runtime.sendAppTopic = (_topic, message) => announcements.push(message);
+  t.after(() => runtime.stop());
+  runtime.sendRegistration();
+  runtime.onServerControlReply(JSON.stringify({ payload: { topic: "nack", payload: { ackId: announcements[0].id,
+    status: "rejected", code: "ERR_SWARM_ACCESS_DENIED", error: "Not authorized" } } }));
+  t.mock.timers.tick(60000);
+  assert.equal(announcements.length, 1);
+});
+
+test("missing registration acknowledgment retries and disconnect cancels the retry", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const announcements = [];
+  const runtime = new SwarmAgent({
+    agent: { agentId: "registration-timeout", runtime: "codex", capabilities: ["graymatter.context"] },
+    apiBase: "https://api-0.valkyrlabs.com/v1", machineId: "registration-host",
+    url: "wss://api-0.valkyrlabs.com/ws", heartbeatSeconds: 30,
+    tokenProvider: async () => "identified-session-fixture", evidence: { record() {} },
+  });
+  runtime.websocket = { readyState: WebSocket.OPEN, send() {}, close() {} };
+  runtime.sendAppTopic = (_topic, message) => announcements.push(message);
+  t.after(() => runtime.stop());
+  runtime.sendRegistration();
+  t.mock.timers.tick(15000);
+  t.mock.timers.tick(1000);
+  assert.equal(announcements.length, 2);
+  runtime.stopped = true;
+  runtime.onClose({ code: 1006 });
+  t.mock.timers.tick(60000);
+  assert.equal(announcements.length, 2);
+});

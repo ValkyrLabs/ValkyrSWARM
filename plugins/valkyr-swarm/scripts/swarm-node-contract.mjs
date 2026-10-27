@@ -1,3 +1,5 @@
+import { providerConnectionHash } from "./swarm-local-inference-provider.mjs";
+
 const NODE_CONTRACT_PROTOCOL = "valkyr-swarm-node/v1";
 const PROVIDER_CONTRACT_PROTOCOL = "valkyr-local-inference-provider/v1";
 
@@ -19,6 +21,19 @@ const MODEL_ONLY_ADVERTISED_ACTIONS = new Set([
   ...MODEL_ONLY_WORKFLOW_ACTIONS,
   ...MODEL_ONLY_LIFECYCLE_ACTIONS,
 ]);
+
+const ENGINE_PLACEMENT_CAPABILITIES = new Set([
+  "java:17", "graymatter.context", "workflow.graph:v1", "workflow.persistence:h2-aes",
+  "workflow.recovery:v1", "workflow.approval-suspension:v1", "workflow.private-authorization:v1",
+  "workflow.approval-denial-transition:v1", "workflow.compensation:v1", "workflow.receipts:v1",
+  "workflow.debugger-control:v1", "workflow.security-fail-closed:v1", "workflow.kill-switch:v1",
+]);
+
+function enginePlacementCapability(capability) {
+  return ENGINE_PLACEMENT_CAPABILITIES.has(capability)
+    || /^execmodule-abi:[a-f0-9]{64}$/.test(capability)
+    || /^workflow-pack:[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9._-]{1,64}$/.test(capability);
+}
 
 const PROVIDER_OPERATIONS = new Set([
   "models.list",
@@ -128,10 +143,15 @@ function validateNodeContract(agent) {
 
 function constrainNodeAdvertisement(agent, advertisement = {}) {
   if (nodeClass(agent) !== NODE_CLASS_MODEL_ONLY) return advertisement;
+  const runtime = advertisement.workflowRuntime;
+  const healthyEngine = runtime?.installed === true && runtime?.healthy === true
+    && runtime?.protocol === "valkyr-workflow-engine/v1";
   return {
     ...advertisement,
     capabilities: (advertisement.capabilities ?? [])
-      .filter((capability) => MODEL_ONLY_ADVERTISED_ACTIONS.has(capability)),
+      // Keep measured engine placement facts; command routing retains its action allowlist.
+      .filter((capability) => MODEL_ONLY_ADVERTISED_ACTIONS.has(capability)
+        || (healthyEngine && enginePlacementCapability(capability))),
     supportedTools: (advertisement.supportedTools ?? [])
       .filter((tool) => MODEL_ONLY_WORKFLOW_ACTIONS.includes(tool)),
     supportedModels: undefined,
@@ -139,6 +159,7 @@ function constrainNodeAdvertisement(agent, advertisement = {}) {
       protocol: PROVIDER_CONTRACT_PROTOCOL,
       kind: agent.nodeContract.localInferenceProvider.kind,
       model: agent.nodeContract.localInferenceProvider.model,
+      endpointHash: providerConnectionHash(agent.nodeContract.localInferenceProvider),
       operations: [...agent.nodeContract.localInferenceProvider.operations],
     },
     nodeContract: {

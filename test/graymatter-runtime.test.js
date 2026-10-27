@@ -367,12 +367,15 @@ test("credit-gated receipts enter a private replay queue and later persist", asy
     assert.equal(queuedText.includes("test-token"), false);
     assert.equal(queuedText.includes("valkyr-swarm-runtime-outcome/v1"), true);
     assert.equal(queuedText.includes("SUCCEEDED"), true);
+    const queuedRecord = JSON.parse(queuedText);
+    const afterCreditRetry = Date.parse(queuedRecord.retry.nextAttemptAt) + 1;
 
     const replayed = await replayQueuedReceipts({
       agentId: "codex-host",
       apiBase: "https://api-0.valkyrlabs.com/v1",
       tokenProvider: async () => "fresh-token",
       replayDir,
+      now: () => afterCreditRetry,
       fetchImpl: async () => new Response(JSON.stringify({ id: "12345678-1234-4234-8234-123456789abc" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },

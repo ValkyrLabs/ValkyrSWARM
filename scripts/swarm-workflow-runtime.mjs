@@ -8,6 +8,9 @@ const WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION =
   "workflow.engine.deny-approval";
 const DEFAULT_TIMEOUT_SECONDS = 900;
 const MAX_RUNTIME_RESPONSE_BYTES = 2 * 1024 * 1024;
+// Matches WorkflowCapabilityGrant.MAX_AUTHORIZATION_EXCHANGE_BYTES: one
+// 1 MiB effective-input snapshot plus immutable authorization metadata.
+const MAX_PRIVATE_AUTHORIZATION_BYTES = 1024 * 1024 + 16 * 1024;
 const WORKFLOW_RUNNER_PROTOCOL = "valkyr-workflow-runner/v1";
 const WORKFLOW_ENGINE_PROTOCOL = "valkyr-workflow-engine/v1";
 const DEPLOYMENT_RUNNER_CAPABILITY = "deployment.runner.execute";
@@ -18,6 +21,7 @@ const JWT_VALUE = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\
 const DEFINITIVE_WORKFLOW_CALLBACK_FENCE_CODES = new Set([
   "WORKFLOW_ENGINE_CALLBACK_RUNNER_NOT_OWNER",
   "WORKFLOW_ENGINE_CALLBACK_LEASE_STALE",
+  "WORKFLOW_ENGINE_CHECKPOINT_REPLACED",
 ]);
 const WORKFLOW_ACTIONS = new Set([
   WORKFLOW_RUNNER_ACTION,
@@ -254,7 +258,13 @@ async function forwardWorkflowEngineEventsOnce({
     };
     const terminal = ["SUCCESS", "FAILED", "CANCELLED"].includes(eventType);
     const authorizationReconciliation = eventType === "AUTHORIZATION_RECONCILIATION_REQUIRED";
-    const checkpoint = eventType === "CHECKPOINT" || authorizationReconciliation;
+    const checkpointState = authorizationReconciliation ? "PAUSED"
+      : String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType).trim().toUpperCase();
+    // Native CHECKPOINT receipts contain references, not outputs. A RUNNING
+    // task checkpoint is progress; only suspension or termination can complete
+    // the mothership execution, using its privately persisted native result.
+    const checkpoint = authorizationReconciliation || (eventType === "CHECKPOINT"
+      && ["WAITING_APPROVAL", "WAITING_USER", "WAITING_UNTIL", "PAUSED"].includes(checkpointState));
     // Correlation identifiers are metadata, not callback transports. Local
     // sandbox/proof executions legitimately retain a command id so duplicate
     // materialization can be detected, but they must never escape the host
@@ -278,9 +288,9 @@ async function forwardWorkflowEngineEventsOnce({
     try {
       if (terminal || checkpoint) {
         const completeUrl = callbackUrl(apiBase, callbacks.complete);
-        const checkpointState = authorizationReconciliation ? "PAUSED"
-          : String(event?.payload?.state ?? event?.payload?.terminalState ?? eventType);
-        const successful = !["FAILED", "CANCELLED"].includes(checkpointState);
+        const result = authorizationReconciliation ? null
+          : await privateWorkflowEngineResult(agent, context, checkpointState, event?.payload?.checkpointRef, fetchImpl);
+        const successful = result ? result.success : true;
         await authorizedJson(completeUrl, {
           workflowExecutionId: executionId,
           workflowRunnerId: context.workflowRunnerId,
@@ -292,11 +302,11 @@ async function forwardWorkflowEngineEventsOnce({
           finalState: authorizationReconciliation ? {
             _workflowAuthorizationRequestId: event?.payload?.authorizationRequestId,
             _workflowAuthorizationStatus: "RECONCILIATION_REQUIRED",
-          } : (event?.payload?.finalState ?? {}),
-          checkpointRef: event?.payload?.checkpointRef ?? null,
-          approvalRef: event?.payload?.approvalRef ?? null,
-          waitingUntil: event?.payload?.waitingUntil ?? null,
-          errorMessage: successful ? null : String(event?.payload?.errorMessage ?? checkpointState),
+          } : result.finalState,
+          checkpointRef: result?.checkpointRef ?? event?.payload?.checkpointRef ?? null,
+          approvalRef: result?.approvalRef ?? event?.payload?.approvalRef ?? null,
+          waitingUntil: result?.waitingUntil ?? event?.payload?.waitingUntil ?? null,
+          errorMessage: successful ? null : String(result?.errorMessage ?? checkpointState),
           errorType: successful ? null : "PERMANENT",
           swarmReceiptRef: `swarm-engine-event:${eventId}`,
         }, tokenProvider, fetchImpl);
@@ -578,6 +588,32 @@ async function boundedPrivateText(response, limit) {
   } finally { reader.releaseLock(); }
 }
 
+/** Retrieve outputs only for the exact fenced checkpoint represented by a replay receipt. */
+async function privateWorkflowEngineResult(agent, context, state, checkpointRef, fetchImpl) {
+  const config = workflowRuntimeConfig(agent);
+  const url = new URL(config.endpoint);
+  url.pathname = `/v1/swarm/workflow-engine/executions/${encodeURIComponent(context.executionId)}/result`;
+  url.search = "";
+  for (const [key, value] of Object.entries({ workflowRunnerId: context.workflowRunnerId,
+    workflowVersionId: context.workflowVersionId, definitionSnapshotHash: context.definitionSnapshotHash,
+    leaseFence: context.leaseFence, terminalState: state, checkpointRef: checkpointRef ?? "" })) {
+    url.searchParams.set(key, String(value));
+  }
+  const response = await fetchImpl(url, { method: "GET", redirect: "error",
+    headers: { Accept: "application/json", ...workflowEngineTransportHeaders(agent) },
+    signal: AbortSignal.timeout(10_000) });
+  let result;
+  try { result = JSON.parse(await boundedPrivateText(response, MAX_RUNTIME_RESPONSE_BYTES)); }
+  catch { throw new Error("Private workflow checkpoint result is invalid"); }
+  if (!response.ok) throw new RemoteWorkflowCallbackError(response.status, result?.code, result?.retryable);
+  if (typeof result?.success !== "boolean" || result.terminalState !== state
+      || !result.finalState || typeof result.finalState !== "object" || Array.isArray(result.finalState)
+      || String(result.checkpointRef ?? "") !== String(checkpointRef ?? "")) {
+    throw new Error("Private workflow checkpoint result does not match the replay receipt");
+  }
+  return result;
+}
+
 /** Frozen inputs travel only between the private node journal and the canonical authenticated issuer. */
 async function exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenProvider, fetchImpl = fetch }) {
   const config = workflowRuntimeConfig(agent);
@@ -592,7 +628,7 @@ async function exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenP
       signal: AbortSignal.timeout(body === undefined ? 10000 : 120000),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     if (!response.ok) throw new Error(`Private workflow authorization transport failed with HTTP ${response.status}`);
-    try { return JSON.parse(await boundedPrivateText(response, 147456)); }
+    try { return JSON.parse(await boundedPrivateText(response, MAX_PRIVATE_AUTHORIZATION_BYTES)); }
     catch (error) { throw new Error("Private workflow authorization response is invalid"); }
   };
   const list = await localRequest("/authorizations");
@@ -611,7 +647,7 @@ async function exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenP
     if (binding?.workflowExecutionId !== reference.executionId || !uuid.test(String(binding?.workflowRunnerId ?? ""))
         || !uuid.test(String(binding?.authorizationRequestId ?? "")) || !Number.isSafeInteger(binding?.leaseFence) || binding.leaseFence < 1
         || !request.effectiveInputs || typeof request.effectiveInputs !== "object" || Array.isArray(request.effectiveInputs)
-        || Buffer.byteLength(JSON.stringify(request), "utf8") > 147456) {
+        || Buffer.byteLength(JSON.stringify(request), "utf8") > MAX_PRIVATE_AUTHORIZATION_BYTES) {
       throw new Error("Private workflow authorization action is invalid");
     }
     const canonicalPath = `/v1/vaiworkflow/engine/executions/${binding.workflowExecutionId}`;
@@ -651,7 +687,9 @@ async function exchangeWorkflowEngineAuthorizationsOnce({ agent, apiBase, tokenP
 async function readRuntimeResponse(response, onProgress) {
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Local Workflow runtime failed with HTTP ${response.status}: ${text.slice(0, 240)}`);
+    const error = new Error(`Local Workflow runtime failed with HTTP ${response.status}: ${text.slice(0, 240)}`);
+    error.status = Number(response.status);
+    throw error;
   }
   const contentType = String(response.headers.get("content-type") ?? "").toLowerCase();
   if (!contentType.includes("ndjson") || !response.body) {
@@ -684,6 +722,29 @@ async function readRuntimeResponse(response, onProgress) {
 }
 
 async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvider, fetchImpl = fetch, onProgress }) {
+  const transportFetch = async (...args) => {
+    try { return await fetchImpl(...args); }
+    catch (error) {
+      if (!["TypeError", "AbortError", "TimeoutError"].includes(error?.name)) throw error;
+      const network = new Error(workflowRuntimeTransportFailure(error));
+      network.code = "WORKFLOW_RUNTIME_NETWORK_FAILURE";
+      throw network;
+    }
+  };
+  try {
+    return await executeWorkflowRuntimeCommandOnce({ agent, wire, apiBase, tokenProvider, fetchImpl: transportFetch, onProgress });
+  } catch (error) {
+    const status = Number(error?.status);
+    const transient = error?.code === "WORKFLOW_RUNTIME_NETWORK_FAILURE"
+      || (error?.retryable !== false && (status >= 500 || status === 408 || status === 429));
+    if (wire?.action !== WORKFLOW_ENGINE_ACTION || !transient) throw error;
+    const incomplete = new Error(workflowRuntimeTransportFailure(error));
+    incomplete.code = "WORKFLOW_ENGINE_TRANSPORT_INCOMPLETE";
+    throw incomplete;
+  }
+}
+
+async function executeWorkflowRuntimeCommandOnce({ agent, wire, apiBase, tokenProvider, fetchImpl = fetch, onProgress }) {
   const config = workflowRuntimeConfig(agent);
   if (!config) throw new Error("This SWARM node has no local Workflow runtime");
   if (!WORKFLOW_ACTIONS.has(wire.action)) throw new Error(`Unsupported Workflow runtime action: ${wire.action}`);
@@ -856,6 +917,9 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     });
     result = await readRuntimeResponse(response, onProgress);
   } catch (error) {
+    // A lost native response cannot establish FAILED: the node-local journal
+    // may already have admitted or completed the immutable invocation.
+    if (engineExecution) throw error;
     result = {
       type: "failed",
       success: false,
@@ -911,8 +975,13 @@ async function executeWorkflowRuntimeCommand({ agent, wire, apiBase, tokenProvid
     checkpointRef: engineExecution ? completion.checkpointRef : null,
     approvalRef: engineExecution ? completion.approvalRef : null,
     waitingUntil: engineExecution ? completion.waitingUntil : null,
-    artifact: result?.outputs ?? result?.result ?? {},
-    completion: completedRun,
+    artifact: engineExecution ? {} : result?.outputs ?? result?.result ?? {},
+    // Core already persisted the private result. Command receipts carry its
+    // identity/state, rather than echoing full context into a bounded STOMP frame.
+    completion: engineExecution && completedRun ? {
+      workflowExecutionId: payload.workflowExecutionId,
+      state: completedRun.state ?? completion.terminalState,
+    } : completedRun,
   };
 }
 
