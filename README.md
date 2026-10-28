@@ -114,7 +114,30 @@ node scripts/swarm-service.mjs rollback-local-update --config /path/to/agent.jso
   --expected-plan-sha256 <planSha256> --source-sha <cleanCommitSha>
 ```
 
-Run the release command from a process separate from the supervised bridge. The live idle check uses the authenticated tenant registry and is an observation at the release boundary; schedule the update during a quiet interval so no new command enters between that observation and reload. Keep the private recovery directory until the full production release is verified.
+Run the release command from a process separate from the supervised bridge. The live idle check uses the authenticated tenant registry and is an observation at the release boundary; schedule the update during a quiet interval so no new command enters between that observation and reload. Keep the private recovery directory until the full production release is verified. If a later Workflow sidecar update changes the shared node configuration, restore that sidecar and configuration first; bridge rollback requires the original configuration digest and will refuse to overwrite intervening changes.
+
+The engineering Workflow sidecar has two separate exact local release steps. Pin its actual Java 17 executable first with `swarm-engineering-toolchain-update.mjs plan|apply`; this preserves every other agent and config byte and verifies the new LaunchAgent PID and engine health. Once the ValkyrAI release has published a same-commit `release-manifest.json` and authenticated engine descriptor, run `swarm-engineering-runtime-adopt.mjs plan|apply` against the updated config SHA. That helper requires the `engineering-project` pack, installs the descriptor-pinned engine and all capability-qualified packs, and verifies installed bytes, Java 17 process, loopback health, pack manifest, and a fresh authenticated heartbeat. Its rollback restores the prior config and sidecar. Roll back engineering runtime adoption before the Java toolchain update, then roll back the shared bridge last; each step refuses changed preimages. The Qwen local-inference node has a separate publisher path and does not update this engineering node.
+
+```bash
+node scripts/swarm-engineering-toolchain-update.mjs plan \
+  --config /path/to/agent.json --agent <engineering-agent-id> \
+  --java /opt/homebrew/opt/openjdk@17/bin/java
+node scripts/swarm-engineering-toolchain-update.mjs apply \
+  --config /path/to/agent.json --agent <engineering-agent-id> \
+  --java /opt/homebrew/opt/openjdk@17/bin/java --plan-sha256 <toolchainPlanSha256>
+node scripts/swarm-engineering-runtime-adopt.mjs plan \
+  --config /path/to/agent.json --agent <engineering-agent-id> \
+  --manifest /path/to/same-commit/release-manifest.json \
+  --descriptor /path/to/authenticated-engine-descriptor.json \
+  --expected-source-sha <testedValkyrAICommitSha> \
+  --expected-config-sha256 <currentConfigSha256>
+node scripts/swarm-engineering-runtime-adopt.mjs apply \
+  --config /path/to/agent.json --agent <engineering-agent-id> \
+  --manifest /path/to/same-commit/release-manifest.json \
+  --descriptor /path/to/authenticated-engine-descriptor.json \
+  --expected-source-sha <testedValkyrAICommitSha> \
+  --expected-config-sha256 <currentConfigSha256> --plan-sha256 <adoptionPlanSha256>
+```
 
 The internal `applyStagedServiceUpdate` and `rollbackServiceUpdate` transaction primitives in `swarm-service.mjs` are tested with fixture files and mocked supervisor workers. They require an exact approved-command binding and an active-lease gate, recheck the reviewed inputs and materialized runtime at replacement, preserve a private rollback definition and durable per-bridge recovery checkpoint, and retain uncertain reload outcomes without automatic resubmission. A rollback interrupted before reload submission can resume; a concurrently changed native definition is preserved. Their results remain `completed: false` and `pendingRecovery: true` after accepted reload dispatch. They have no CLI command, agent capability, or production supervisor adapter. Canonical server approval/dispatch, a drain fence for all affected agents, an independent worker that verifies the expected native definition immediately before reload, fresh runtime/heartbeat evidence, and terminal GrayMatter receipt reconciliation still need integration before activation is available to users.
 

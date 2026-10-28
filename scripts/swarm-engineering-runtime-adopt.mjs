@@ -452,8 +452,9 @@ function parseArgs(argv) {
     throw new Error("Exact config and engineering agent are required");
   }
   if (command !== "rollback" && (!options.manifest || !options.descriptor
-      || !HEX64.test(options["expected-config-sha256"] ?? ""))) {
-    throw new Error("Same-commit manifest, descriptor, and config preimage are required");
+      || !HEX64.test(options["expected-config-sha256"] ?? "")
+      || !COMMIT.test(options["expected-source-sha"] ?? ""))) {
+    throw new Error("Exact tested source, same-commit manifest, descriptor, and config preimage are required");
   }
   if (command !== "plan" && !HEX64.test(options["plan-sha256"] ?? "")) {
     throw new Error("Exact adoption plan SHA-256 is required");
@@ -477,6 +478,9 @@ async function main() {
   const plan = planAdoption({ configPath: options.config, agentId: options.agent,
     manifestPath: options.manifest, descriptorPath: options.descriptor,
     expectedConfigSha256: options["expected-config-sha256"], servicePath });
+  if (plan.sourceCommit !== options["expected-source-sha"]) {
+    throw new Error("Engineering runtime manifest does not match the tested source commit");
+  }
   if (options.command === "plan") {
     process.stdout.write(`${JSON.stringify(plan)}\n`);
     return;
