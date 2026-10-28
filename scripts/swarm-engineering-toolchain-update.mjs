@@ -131,6 +131,37 @@ function patchAgentJava(source, agentId, javaExecutable) {
     healthEndpoint: agent.workflowRuntime.healthEndpoint };
 }
 
+function patchAgentInstall(source, agentId, releaseFields) {
+  const config = JSON.parse(source);
+  const matching = config.agents?.filter((agent) => agent?.agentId === agentId) ?? [];
+  if (matching.length !== 1) throw new Error("Expected one exact engineering agent");
+  const agent = matching[0];
+  if (agent.workflowRuntime?.tier !== "engine"
+      || !agent.capabilities?.includes("engineering.project.execute")
+      || !agent.workflowRuntime.supportedTools?.includes("workflow.engine.execute-workflow")) {
+    throw new Error("Selected agent lacks the engineering Workflow engine contract");
+  }
+  const originalInstall = agent.workflowRuntime.install;
+  if (!originalInstall || typeof originalInstall.artifactUrl !== "string"
+      || !HEX64.test(originalInstall.sha256 ?? "")) {
+    throw new Error("Existing engineering engine cannot be restored");
+  }
+  const updatedInstall = { ...originalInstall, ...releaseFields };
+  const agents = onlyMember(source, skipSpace(source, 0), "agents");
+  const spans = arrayItems(source, agents.start).filter((item) =>
+    JSON.parse(source.slice(item.start, item.end))?.agentId === agentId);
+  if (spans.length !== 1) throw new Error("Ambiguous engineering agent JSON span");
+  const workflow = onlyMember(source, spans[0].start, "workflowRuntime");
+  const install = onlyMember(source, workflow.start, "install");
+  const updated = source.slice(0, install.start) + JSON.stringify(updatedInstall) + source.slice(install.end);
+  const expected = structuredClone(config);
+  expected.agents.find((item) => item.agentId === agentId).workflowRuntime.install = updatedInstall;
+  assert.deepEqual(JSON.parse(updated), expected);
+  return { updated, originalInstall, updatedInstall,
+    healthEndpoint: agent.workflowRuntime.healthEndpoint,
+    capabilities: [...agent.capabilities, ...(agent.workflowRuntime.capabilities ?? [])] };
+}
+
 function exactJava17(executable) {
   if (!path.isAbsolute(executable)) throw new Error("Java executable must be absolute");
   const resolved = fs.realpathSync(executable);
@@ -364,4 +395,4 @@ if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(SCRI
   });
 }
 
-export { applyPlan, buildPlan, patchAgentJava, rollbackPlan };
+export { applyPlan, buildPlan, patchAgentInstall, patchAgentJava, rollbackPlan };
