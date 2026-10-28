@@ -1,5 +1,6 @@
 import { bootstrapWorkflowGrantTrust } from "./swarm-workflow-trust.mjs";
 import { workflowEngineTransportHeaders } from "./swarm-workflow-transport.mjs";
+import crypto from "node:crypto";
 
 const WORKFLOW_RUNNER_ACTION = "workflow.runner.execute-module";
 const WORKFLOW_ENGINE_ACTION = "workflow.engine.execute-workflow";
@@ -8,6 +9,10 @@ const WORKFLOW_ENGINE_APPROVAL_DENIAL_ACTION =
   "workflow.engine.deny-approval";
 const DEFAULT_TIMEOUT_SECONDS = 900;
 const MAX_RUNTIME_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_GENERATED_PROJECT_BYTES = 128 * 1024 * 1024;
+const TENANT_VALIDATION_DEFINITION_PREFIX = "workflow.tenant-mission-validation:";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256 = /^[a-f0-9]{64}$/;
 // Matches WorkflowCapabilityGrant.MAX_AUTHORIZATION_EXCHANGE_BYTES: one
 // 1 MiB effective-input snapshot plus immutable authorization metadata.
 const MAX_PRIVATE_AUTHORIZATION_BYTES = 1024 * 1024 + 16 * 1024;
@@ -588,6 +593,112 @@ async function boundedPrivateText(response, limit) {
   } finally { reader.releaseLock(); }
 }
 
+async function boundedPrivateBytes(response, limit) {
+  if (Number(response.headers?.get("content-length")) > limit) {
+    throw new Error("Generated project exceeds its size bound");
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) throw new Error("Generated project response has no byte stream");
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        await reader.cancel();
+        throw new Error("Generated project exceeds its size bound");
+      }
+      chunks.push(Buffer.from(value));
+    }
+    if (bytes === 0) throw new Error("Generated project archive is empty");
+    return Buffer.concat(chunks, bytes);
+  } finally { reader.releaseLock(); }
+}
+
+function tenantValidationInputs(materialization, generatedProjectCallback) {
+  let snapshot;
+  try {
+    snapshot = JSON.parse(String(materialization?.definitionSnapshot ?? ""));
+  } catch {
+    if (generatedProjectCallback) throw new Error("Generated project callback has no canonical workflow snapshot");
+    return null;
+  }
+  const state = materialization?.initialState;
+  const applicationId = String(state?.applicationId ?? "");
+  const definitionKey = snapshot?.submittedGraph?.workflow?.definitionKey;
+  const canonical = UUID.test(applicationId)
+    && definitionKey === `${TENANT_VALIDATION_DEFINITION_PREFIX}${applicationId}`;
+  if (!canonical) {
+    if (generatedProjectCallback) throw new Error("Generated project callback is not bound to tenant validation");
+    return null;
+  }
+  const generationReceiptRef = String(state?.generationReceiptRef ?? "");
+  const projectArchiveSha256 = String(state?.projectArchiveSha256 ?? "");
+  if (!generatedProjectCallback || !materialization?.materializationProof
+      || !generationReceiptRef || generationReceiptRef.length > 200
+      || !SHA256.test(projectArchiveSha256)) {
+    throw new Error("Canonical tenant validation lacks a signed generated-project handoff");
+  }
+  return { applicationId, generationReceiptRef, projectArchiveSha256 };
+}
+
+async function stageTenantGeneratedProject({ agent, wire, apiBase, tokenProvider,
+  fetchImpl, config, materialization, callback, inputs, onProgress }) {
+  const executionId = materialization.workflowExecutionId;
+  const runnerId = materialization.workflowRunnerId;
+  const fence = Number(materialization.leaseFence);
+  const expectedPath = `/v1/vaiworkflow/engine/executions/${encodeURIComponent(executionId)}`
+    + `/generated-project/${encodeURIComponent(runnerId)}/${fence}`;
+  const handoffUrl = callbackUrl(apiBase, callback);
+  if (handoffUrl.pathname !== expectedPath || handoffUrl.search || handoffUrl.hash) {
+    throw new Error("Generated project handoff is not bound to the fenced execution");
+  }
+  const get = async (forceRefresh = false) => {
+    const token = await tokenProvider({ forceRefresh });
+    if (!token) throw new Error("Generated project handoff requires an authenticated SWARM session");
+    return fetchImpl(handoffUrl, { method: "GET", redirect: "error",
+      signal: AbortSignal.timeout(120_000),
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/zip" } });
+  };
+  let project = await get();
+  if (project.status === 401 || project.status === 403) project = await get(true);
+  if (!project.ok) throw new RemoteWorkflowCallbackError(project.status);
+  if (String(project.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase() !== "application/zip"
+      || project.headers.get("x-valkyr-project-sha256") !== inputs.projectArchiveSha256
+      || project.headers.get("x-valkyr-generation-receipt-ref") !== inputs.generationReceiptRef
+      || project.headers.get("x-valkyr-application-id")?.toLowerCase() !== inputs.applicationId.toLowerCase()) {
+    throw new Error("Generated project handoff headers differ from signed validation inputs");
+  }
+  const archive = await boundedPrivateBytes(project, MAX_GENERATED_PROJECT_BYTES);
+  if (crypto.createHash("sha256").update(archive).digest("hex") !== inputs.projectArchiveSha256) {
+    throw new Error("Generated project bytes differ from signed validation checksum");
+  }
+  const stageUrl = new URL(
+    `/v1/swarm/workflow-engine/executions/${encodeURIComponent(executionId)}/generated-project`,
+    config.endpoint,
+  );
+  const staged = await fetchImpl(stageUrl, { method: "POST", redirect: "error",
+    signal: AbortSignal.timeout(120_000),
+    headers: { ...workflowEngineTransportHeaders(agent),
+      "X-Valkyr-Swarm-Command-Id": wire.commandId,
+      "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ materialization, archiveBase64: archive.toString("base64") }),
+  });
+  if (!staged.ok) throw new Error(`Local Workflow engine project staging failed with HTTP ${staged.status}`);
+  let receipt;
+  try { receipt = JSON.parse(await boundedPrivateText(staged, 16_384)); }
+  catch { throw new Error("Local Workflow engine project staging receipt is invalid"); }
+  if (receipt?.staged !== true || receipt.workflowExecutionId !== executionId
+      || receipt.workflowRunnerId !== runnerId || Number(receipt.leaseFence) !== fence
+      || receipt.projectArchiveSha256 !== inputs.projectArchiveSha256
+      || Number(receipt.bytes) !== archive.length) {
+    throw new Error("Local Workflow engine project staging receipt differs from signed validation inputs");
+  }
+  onProgress?.({ stream: "workflow", text: "Exact generated project staged on selected runner" });
+}
+
 /** Retrieve outputs only for the exact fenced checkpoint represented by a replay receipt. */
 async function privateWorkflowEngineResult(agent, context, state, checkpointRef, fetchImpl) {
   const config = workflowRuntimeConfig(agent);
@@ -879,6 +990,12 @@ async function executeWorkflowRuntimeCommandOnce({ agent, wire, apiBase, tokenPr
       || (engineExecution && materialization?.definitionSnapshotHash !== payload.definitionSnapshotHash)) {
     throw new Error("Remote workflow materialization does not match the fenced command");
   }
+  if (!engineExecution && callbacks?.generatedProject) {
+    throw new Error("Generated project handoff requires the durable Workflow engine");
+  }
+  const generatedProject = engineExecution
+    ? tenantValidationInputs(materialization, callbacks?.generatedProject)
+    : null;
   onProgress?.({ stream: "workflow", text: "Immutable workflow materialization authorized" });
   if (engineExecution && materialization.materializationProof) {
     await bootstrapWorkflowGrantTrust({ agent, apiBase, runnerId: payload.workflowRunnerId, tokenProvider, fetchImpl });
@@ -894,6 +1011,11 @@ async function executeWorkflowRuntimeCommandOnce({ agent, wire, apiBase, tokenPr
   const startedAt = Date.now();
   let result;
   try {
+    if (generatedProject) {
+      await stageTenantGeneratedProject({ agent, wire, apiBase, tokenProvider, fetchImpl,
+        config, materialization, callback: callbacks.generatedProject, inputs: generatedProject,
+        onProgress });
+    }
     onProgress?.({ stream: "workflow", text: "Workflow engine execution started" });
     const response = await fetchImpl(config.endpoint, {
       method: "POST",
