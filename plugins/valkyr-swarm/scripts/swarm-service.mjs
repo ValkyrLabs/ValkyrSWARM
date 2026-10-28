@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
+import { ValkyrSwarmClient } from "../mcp-server/index.js";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -27,7 +29,7 @@ const SERVICE_RUNTIME_FILES = Object.freeze([
 
 function usage(exitCode = 0) {
   const stream = exitCode === 0 ? process.stdout : process.stderr;
-  stream.write(`Usage: node scripts/swarm-service.mjs <command> --config <json> [options]\n\nInstalls and operates a launchd or systemd-user service for one SWARM host.\n\nCommands:\n  install          Install and start the service\n  uninstall        Stop and remove the service\n  start            Start the installed service\n  stop             Stop the service\n  restart          Restart the service\n  status           Print service state\n  plan-update      Preview an exact shared-bridge artifact update without applying it\n  stage-update     Stage private candidate bytes for an exact preview; never activate\n  print-service    Print the native service definition\n  print-plist      Alias for macOS compatibility\n  print-unit       Alias for Linux compatibility\n  self-test        Validate service safety offline\n\nOptions:\n  --expected-plan-sha256 <hex> Required plan identity for stage-update\n  --config <path>              Machine SWARM configuration\n  --url <url>                  Override config.serverUrl\n  --receipt-log <path>         Redacted JSONL evidence path\n  --stdout-log <path>          Supervisor stdout path\n  --stderr-log <path>          Supervisor stderr path\n  --keychain-service <name>    macOS token service\n  --token-file <path>          Mode-0600 token file\n  --credential-file <path>     Mode-0600 credentials for session refresh\n  --label <name>               Override deterministic service label\n  -h, --help                   Show this help\n\nNo JWT, username, or password is written into the service definition.\n`);
+  stream.write(`Usage: node scripts/swarm-service.mjs <command> --config <json> [options]\n\nInstalls and operates a launchd or systemd-user service for one SWARM host.\n\nCommands:\n  install          Install and start the service\n  uninstall        Stop and remove the service\n  start            Start the installed service\n  stop             Stop the service\n  restart          Restart the service\n  status           Print service state\n  plan-update      Preview an exact shared-bridge artifact update without applying it\n  stage-update     Stage private candidate bytes for an exact preview; never activate\n  apply-local-update  Apply an exact local operator release with rollback and live proof\n  rollback-local-update  Restore the exact prior bridge from its release checkpoint\n  print-service    Print the native service definition\n  print-plist      Alias for macOS compatibility\n  print-unit       Alias for Linux compatibility\n  self-test        Validate service safety offline\n\nOptions:\n  --expected-plan-sha256 <hex> Exact reviewed plan identity\n  --expected-config-sha256 <hex> Exact configuration preimage for local release\n  --expected-definition-sha256 <hex> Exact native definition preimage\n  --source-sha <hex>          Clean committed ValkyrSWARM source revision\n  --config <path>              Machine SWARM configuration\n  --url <url>                  Override config.serverUrl\n  --receipt-log <path>         Redacted JSONL evidence path\n  --stdout-log <path>          Supervisor stdout path\n  --stderr-log <path>          Supervisor stderr path\n  --keychain-service <name>    macOS token service\n  --token-file <path>          Mode-0600 token file\n  --credential-file <path>     Mode-0600 credentials for session refresh\n  --label <name>               Override deterministic service label\n  -h, --help                   Show this help\n\nNo JWT, username, or password is written into the service definition.\n`);
   process.exit(exitCode);
 }
 
@@ -41,13 +43,15 @@ function parseArgs(argv) {
   const command = argv[0];
   const commands = new Set([
     "install", "uninstall", "start", "stop", "restart", "status",
-    "print-service", "print-plist", "print-unit", "plan-update", "stage-update", "self-test",
+    "print-service", "print-plist", "print-unit", "plan-update", "stage-update",
+    "apply-local-update", "rollback-local-update", "self-test",
   ]);
   if (!commands.has(command)) throw new Error(`Unknown command: ${command}`);
   const options = { command };
   const valueOptions = new Set([
     "--config", "--url", "--receipt-log", "--stdout-log", "--stderr-log",
     "--keychain-service", "--token-file", "--credential-file", "--label", "--expected-plan-sha256",
+    "--expected-config-sha256", "--expected-definition-sha256", "--source-sha",
   ]);
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -769,6 +773,149 @@ async function rollbackServiceUpdate(spec, { wire, reload } = {}) {
   return updateResult(record, directory);
 }
 
+// A local operator release is a separate authority boundary from a server
+// command. It is explicitly invoked with the reviewed source revision and
+// exact preimage hashes; it never fabricates a gm_approval reference or makes
+// the protected service.lifecycle.update action available to agents.
+const LOCAL_RELEASE_SCHEMA = "valkyr-local-service-release/v1";
+
+function localReleaseResult(record, directory) {
+  return {
+    schemaVersion: LOCAL_RELEASE_SCHEMA,
+    status: record.phase,
+    completed: record.phase === "verified" || record.phase === "rolled_back",
+    planSha256: record.plan.planSha256,
+    sourceSha: record.sourceSha,
+    affectedAgentIds: record.plan.affectedAgentIds,
+    recoveryDirectory: directory,
+  };
+}
+
+function validateLocalReleasePlan(spec, { expectedPlanSha256, expectedConfigSha256,
+    expectedDefinitionSha256, sourceSha, sourceRoot = SCRIPT_DIR } = {}) {
+  for (const [name, value, length] of [
+    ["plan", expectedPlanSha256, 64], ["config", expectedConfigSha256, 64],
+    ["definition", expectedDefinitionSha256, 64], ["source", sourceSha, 40],
+  ]) {
+    if (typeof value !== "string" || !new RegExp(`^[a-f0-9]{${length}}$`).test(value)) {
+      throw new Error(`Local release requires an exact ${name} SHA-256 or commit`);
+    }
+  }
+  validateUpdatePaths(spec);
+  const plan = serviceUpdatePlan(spec, { sourceRoot });
+  if (plan.planSha256 !== expectedPlanSha256
+      || plan.configuration.sha256 !== expectedConfigSha256
+      || plan.current.definitionSha256 !== expectedDefinitionSha256) {
+    throw new Error("Local release preimage or reviewed plan changed");
+  }
+  return plan;
+}
+
+async function applyLocalServiceRelease(spec, options = {}) {
+  const { assertIdle, reload, attest, sourceRoot = SCRIPT_DIR } = options;
+  if (typeof assertIdle !== "function" || typeof reload !== "function" || typeof attest !== "function") {
+    throw new Error("Local release requires active-task, independent supervisor and fresh-health adapters");
+  }
+  const plan = validateLocalReleasePlan(spec, options);
+  const candidate = stageServiceUpdate(spec, { expectedPlanSha256: plan.planSha256, sourceRoot });
+  const definition = serviceDefinition(spec);
+  const verify = () => {
+    const current = validateLocalReleasePlan(spec, options);
+    if (current.planSha256 !== plan.planSha256) throw new Error("Local release plan changed");
+    verifyCandidate(candidate.candidateDirectory, plan, definition);
+  };
+  verify();
+  if (await assertIdle([...plan.affectedAgentIds]) !== true) {
+    throw new Error("Active SWARM commands prevent the shared bridge release");
+  }
+  verify();
+  const directory = updateRecoveryDirectory(spec, { createParent: true });
+  try { fs.mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) {
+    if (error?.code === "EEXIST") throw new Error("A pending bridge release requires recovery before another apply");
+    throw error;
+  }
+  syncDirectory(path.dirname(directory));
+  const original = updatePrivateBytes(spec.servicePath);
+  if (updateHash(original) !== plan.current.definitionSha256) {
+    throw new Error("Native bridge definition changed before rollback checkpoint");
+  }
+  writeCandidateFile(path.join(directory, "rollback-definition"), original);
+  let record = { schemaVersion: LOCAL_RELEASE_SCHEMA, phase: "prepared",
+    createdAt: new Date().toISOString(), sourceSha: options.sourceSha, plan };
+  writeUpdateRecord(directory, record);
+  const advance = (phase, extra = {}) => {
+    const next = { ...record, ...extra, phase };
+    writeUpdateRecord(directory, next, record);
+    record = next;
+  };
+  updateDirectory([".local", "share", "valkyr-swarm", "service-runtimes"], { create: true });
+  stageServiceRuntime(spec, path.join(candidate.candidateDirectory, "runtime"));
+  verify();
+  replaceUpdateDefinition(spec, plan.current.definitionSha256, definition, verify);
+  advance("activation_started", { activationStartedAt: new Date().toISOString() });
+  const dispatched = await reload({ operation: "activate", spec, plan, recoveryDirectory: directory });
+  if (dispatched?.accepted !== true) throw new Error("Bridge reload outcome is uncertain; recovery is required");
+  advance("awaiting_attestation");
+  const proof = await attest({ operation: "activate", spec, plan,
+    since: record.activationStartedAt, expectedDefinitionSha256: plan.candidate.definitionSha256 });
+  if (proof?.healthy !== true) throw new Error("Fresh exact-agent bridge attestation did not succeed; rollback is available");
+  advance("verified", { proof: { observedAt: proof.observedAt,
+    nativePid: proof.nativePid, agentCount: plan.affectedAgentIds.length } });
+  return localReleaseResult(record, directory);
+}
+
+async function rollbackLocalServiceRelease(spec, { expectedPlanSha256, sourceSha, reload, attest } = {}) {
+  if (typeof reload !== "function" || typeof attest !== "function") {
+    throw new Error("Local rollback requires independent supervisor and fresh-health adapters");
+  }
+  validateUpdatePaths(spec);
+  const directory = updateRecoveryDirectory(spec);
+  verifyStageDirectory(directory, 0o700);
+  let record = JSON.parse(updatePrivateBytes(path.join(directory, "record.json"), { readonly: true }));
+  const { planSha256, ...body } = record.plan ?? {};
+  if (record.schemaVersion !== LOCAL_RELEASE_SCHEMA || updateHash(JSON.stringify(body)) !== planSha256
+      || record.plan.planSha256 !== expectedPlanSha256 || record.sourceSha !== sourceSha
+      || record.plan.expectedMachineId !== spec.machineId || record.plan.label !== spec.label) {
+    throw new Error("Local rollback authority or saved plan mismatch");
+  }
+  if (!["prepared", "activation_started", "awaiting_attestation", "verified", "rollback_prepared"].includes(record.phase)) {
+    throw new Error("Rollback already submitted or outcome uncertain; inspect recovery record");
+  }
+  if (updateHash(readPreviewFile(spec.configPath, "SWARM configuration")) !== record.plan.configuration.sha256) {
+    throw new Error("SWARM configuration changed before rollback");
+  }
+  const original = updatePrivateBytes(path.join(directory, "rollback-definition"), { readonly: true });
+  if (updateHash(original) !== record.plan.current.definitionSha256) throw new Error("Rollback definition verification failed");
+  const current = updateHash(updatePrivateBytes(spec.servicePath));
+  if (![record.plan.current.definitionSha256, record.plan.candidate.definitionSha256].includes(current)) {
+    throw new Error("Native definition changed to unrecognized bytes; rollback will not overwrite it");
+  }
+  const advance = (phase, extra = {}) => {
+    const next = { ...record, ...extra, phase };
+    writeUpdateRecord(directory, next, record);
+    record = next;
+  };
+  if (record.phase !== "rollback_prepared") advance("rollback_prepared");
+  if (current !== record.plan.current.definitionSha256) {
+    replaceUpdateDefinition(spec, current, original, () => {
+      if (updateHash(readPreviewFile(spec.configPath, "SWARM configuration")) !== record.plan.configuration.sha256) {
+        throw new Error("SWARM configuration changed during rollback");
+      }
+    });
+  }
+  advance("rollback_reload_started", { rollbackStartedAt: new Date().toISOString() });
+  const dispatched = await reload({ operation: "rollback", spec, plan: record.plan, recoveryDirectory: directory });
+  if (dispatched?.accepted !== true) throw new Error("Bridge rollback reload is uncertain; recovery is required");
+  advance("rollback_awaiting_attestation");
+  const proof = await attest({ operation: "rollback", spec, plan: record.plan,
+    since: record.rollbackStartedAt, expectedDefinitionSha256: record.plan.current.definitionSha256 });
+  if (proof?.healthy !== true) throw new Error("Prior bridge did not regain fresh exact-agent health");
+  advance("rolled_back", { proof: { observedAt: proof.observedAt,
+    nativePid: proof.nativePid, agentCount: record.plan.affectedAgentIds.length } });
+  return localReleaseResult(record, directory);
+}
+
 function run(executable, args, { allowFailure = false, capture = false } = {}) {
   const result = spawnSync(executable, args, {
     encoding: "utf8",
@@ -833,6 +980,98 @@ function status(spec) {
   if (result.status !== 0) process.exitCode = 3;
 }
 
+function registryReleaseProof(snapshot, plan, machineId, since = null, now = Date.now()) {
+  const registry = snapshot?.registry;
+  if (!registry || typeof registry !== "object") return false;
+  for (const id of plan.affectedAgentIds) {
+    const agent = registry[id];
+    const observed = Date.parse(agent?.lastSeen ?? "");
+    if (agent?.machineId !== machineId || agent?.status !== "healthy"
+        || !Number.isFinite(observed) || observed < now - 90_000
+        || (since && observed <= Date.parse(since))) return false;
+    if (!since && agent?.activeTasks !== 0) return false;
+  }
+  return true;
+}
+
+function nativeReleaseStatus(spec) {
+  const result = spec.platform === "darwin"
+    ? run("/bin/launchctl", ["print", launchTarget(spec)], { allowFailure: true, capture: true })
+    : run("systemctl", ["--user", "show", `${spec.label}.service`,
+      "--property=ActiveState,MainPID,ExecStart", "--no-pager"], { allowFailure: true, capture: true });
+  if (result.status !== 0) return null;
+  const output = result.stdout || "";
+  const running = spec.platform === "darwin"
+    ? /\bstate = running\b/.test(output) : /\bActiveState=active\b/.test(output);
+  const pid = Number((spec.platform === "darwin"
+    ? output.match(/\bpid = (\d+)\b/) : output.match(/\bMainPID=(\d+)\b/))?.[1]);
+  if (!running || !Number.isSafeInteger(pid) || pid < 1) return null;
+  return { pid, output };
+}
+
+function localReleaseAdapters(spec) {
+  const client = new ValkyrSwarmClient({ env: {
+    ...process.env,
+    VALKYR_API_BASE: spec.serverUrl,
+    VALKYR_KEYCHAIN_SERVICE: spec.keychainService,
+    VALKYR_SWARM_TOKEN_FILE: spec.tokenFile,
+    VALKYR_SWARM_CREDENTIAL_FILE: spec.credentialFile,
+  } });
+  let priorPid = null;
+  return {
+    assertIdle: async (ids) => {
+      const live = nativeReleaseStatus(spec);
+      if (!live) return false;
+      const plan = { affectedAgentIds: ids };
+      const snapshot = await client.agentsSnapshot();
+      return registryReleaseProof(snapshot, plan, spec.machineId);
+    },
+    reload: async () => {
+      priorPid = nativeReleaseStatus(spec)?.pid ?? null;
+      if (spec.platform === "darwin") {
+        run("/bin/launchctl", ["bootout", `gui/${process.getuid()}`, spec.servicePath]);
+        run("/bin/launchctl", ["bootstrap", `gui/${process.getuid()}`, spec.servicePath]);
+        run("/bin/launchctl", ["kickstart", "-k", launchTarget(spec)]);
+      } else {
+        run("systemctl", ["--user", "daemon-reload"]);
+        run("systemctl", ["--user", "restart", `${spec.label}.service`]);
+      }
+      return { accepted: true };
+    },
+    attest: async ({ plan, since, expectedDefinitionSha256 }) => {
+      for (let attempt = 0; attempt < 24; attempt += 1) {
+        const native = nativeReleaseStatus(spec);
+        const definition = readPreviewFile(spec.servicePath, "Native service definition");
+        if (native && native.pid !== priorPid && updateHash(definition) === expectedDefinitionSha256) {
+          const script = definition.toString().match(/(\/[^<\s]+\/swarm-agent\.mjs)/)?.[1];
+          if (script && native.output.includes(script)) {
+            try {
+              const snapshot = await client.agentsSnapshot();
+              if (registryReleaseProof(snapshot, plan, spec.machineId, since)) {
+                return { healthy: true, observedAt: new Date().toISOString(), nativePid: native.pid };
+              }
+            } catch { /* A transient registry read cannot establish fresh attestation. */ }
+          }
+        }
+        await delay(5_000);
+      }
+      return { healthy: false };
+    },
+  };
+}
+
+function requireCommittedLocalRelease(sourceSha) {
+  if (!/^[a-f0-9]{40}$/.test(sourceSha ?? "")) throw new Error("Local release requires a full source commit SHA");
+  const revision = spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "HEAD"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const dirty = spawnSync("git", ["-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=no"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (revision.status !== 0 || revision.stdout.trim() !== sourceSha
+      || dirty.status !== 0 || dirty.stdout.trim()) {
+    throw new Error("Local release source must be the exact clean committed revision");
+  }
+}
+
 function selfTest() {
   const loaded = {
     config: {
@@ -872,19 +1111,42 @@ function selfTest() {
   process.stdout.write("Valkyr SWARM service self-test passed\n");
 }
 
-function main() {
+async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.command === "self-test") return selfTest();
   if (!["darwin", "linux"].includes(process.platform)) {
     throw new Error("Use swarm-activate --foreground on platforms without launchd or systemd-user");
   }
-  const spec = serviceSpec(options, loadConfig(options.config, { bounded: ["plan-update", "stage-update"].includes(options.command) }));
+  const localRelease = ["apply-local-update", "rollback-local-update"].includes(options.command);
+  if (localRelease && ["url", "label", "tokenFile", "credentialFile", "keychainService",
+    "receiptLog", "stdoutLog", "stderrLog"].some((key) => options[key] !== undefined)) {
+    throw new Error("Local release only accepts the canonical machine configuration and exact hash inputs");
+  }
+  const spec = serviceSpec(options, loadConfig(options.config,
+    { bounded: ["plan-update", "stage-update", "apply-local-update", "rollback-local-update"].includes(options.command) }));
   if (options.command === "plan-update") {
     process.stdout.write(`${JSON.stringify(serviceUpdatePlan(spec), null, 2)}\n`);
     return;
   }
   if (options.command === "stage-update") {
     process.stdout.write(`${JSON.stringify(stageServiceUpdate(spec, { expectedPlanSha256: options.expectedPlanSha256 }), null, 2)}\n`);
+    return;
+  }
+  if (localRelease) {
+    requireCommittedLocalRelease(options.sourceSha);
+    const adapters = localReleaseAdapters(spec);
+    const result = options.command === "apply-local-update"
+      ? await applyLocalServiceRelease(spec, {
+        expectedPlanSha256: options.expectedPlanSha256,
+        expectedConfigSha256: options.expectedConfigSha256,
+        expectedDefinitionSha256: options.expectedDefinitionSha256,
+        sourceSha: options.sourceSha, ...adapters,
+      })
+      : await rollbackLocalServiceRelease(spec, {
+        expectedPlanSha256: options.expectedPlanSha256,
+        sourceSha: options.sourceSha, reload: adapters.reload, attest: adapters.attest,
+      });
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
   if (["print-service", "print-plist", "print-unit"].includes(options.command)) {
@@ -902,20 +1164,21 @@ function main() {
 // Node resolves the module URL through symlinks, while argv retains the path
 // used to launch it (including macOS /var aliases and installed CLI links).
 if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error) => {
     process.stderr.write(`Valkyr SWARM service failed: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(1);
-  }
+  });
 }
 
 export {
   SERVICE_RUNTIME_FILES,
+  applyLocalServiceRelease,
   applyStagedServiceUpdate,
   parseArgs,
   plist,
   rollbackServiceUpdate,
+  rollbackLocalServiceRelease,
+  registryReleaseProof,
   serviceDefinition,
   serviceRuntimeDigest,
   serviceSpec,

@@ -98,6 +98,24 @@ Prepare the reviewed candidate locally with `node scripts/swarm-service.mjs stag
 
 Staging leaves the installed runtime, native service definition, and running process untouched. Its receipt explicitly reports `staged: true`, `applied: false`, and `authorized: false`. A failed or interrupted preparation may leave a private `.preparing-*` directory; a failure after rename may leave an intact candidate for an obsolete plan. Neither is an activation receipt. No update capability is advertised: exact server approval, activation-time plan/artifact verification, durable replacement recovery, rollback, and live health proof remain prerequisites for a future governed update action.
 
+For an explicitly authorized **local operator release** from a clean, committed checkout, the same plan can be applied without representing a local shell command as a server-approved SWARM command. `apply-local-update` requires the full source commit, plan digest, configuration digest, and native definition digest. It checks that every agent sharing the bridge is healthy, freshly registered, and idle; checkpoints the exact prior native definition privately; installs the digest-addressed bridge bytes; reloads launchd or systemd-user; and waits for a new process and fresh heartbeats from every affected agent. The release receipt identifies the source commit and recovery directory without printing credentials. A failure after replacement retains the recovery checkpoint for an explicit `rollback-local-update`; it does not blindly replay an uncertain supervisor operation. The local operator path never accepts or fabricates a `gm_approval_` reference, never advertises `service.lifecycle.update`, and does not replace the protected remote command protocol.
+
+```bash
+node scripts/swarm-service.mjs plan-update --config /path/to/agent.json
+node scripts/swarm-service.mjs stage-update --config /path/to/agent.json \
+  --expected-plan-sha256 <planSha256>
+node scripts/swarm-service.mjs apply-local-update --config /path/to/agent.json \
+  --expected-plan-sha256 <planSha256> \
+  --expected-config-sha256 <configurationSha256> \
+  --expected-definition-sha256 <currentDefinitionSha256> \
+  --source-sha <cleanCommitSha>
+# If activation remains uncertain or later verification fails:
+node scripts/swarm-service.mjs rollback-local-update --config /path/to/agent.json \
+  --expected-plan-sha256 <planSha256> --source-sha <cleanCommitSha>
+```
+
+Run the release command from a process separate from the supervised bridge. The live idle check uses the authenticated tenant registry and is an observation at the release boundary; schedule the update during a quiet interval so no new command enters between that observation and reload. Keep the private recovery directory until the full production release is verified.
+
 The internal `applyStagedServiceUpdate` and `rollbackServiceUpdate` transaction primitives in `swarm-service.mjs` are tested with fixture files and mocked supervisor workers. They require an exact approved-command binding and an active-lease gate, recheck the reviewed inputs and materialized runtime at replacement, preserve a private rollback definition and durable per-bridge recovery checkpoint, and retain uncertain reload outcomes without automatic resubmission. A rollback interrupted before reload submission can resume; a concurrently changed native definition is preserved. Their results remain `completed: false` and `pendingRecovery: true` after accepted reload dispatch. They have no CLI command, agent capability, or production supervisor adapter. Canonical server approval/dispatch, a drain fence for all affected agents, an independent worker that verifies the expected native definition immediately before reload, fresh runtime/heartbeat evidence, and terminal GrayMatter receipt reconciliation still need integration before activation is available to users.
 
 To enable the deployment pack on a capable ValorIDE node, activate the durable engine with `--deployment-runner-endpoint http://127.0.0.1:3002/api/deployments/execute` and, when needed, `--deployment-credential-ref keychain:SERVICE:ACCOUNT`. The deployment capability is withdrawn from heartbeats whenever the engine or the runner's `valkyr-deployment-runner/v1` health probe is not healthy. The endpoint and credential reference are node configuration; workflow state cannot replace either value.
